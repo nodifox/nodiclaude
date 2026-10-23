@@ -359,6 +359,202 @@ grep -q extra.sh "$S" && ko "install: removed hook entry in settings" || ok "ins
 [ -f "$HOME/.claude/skills/foreign.md" ] && ok "install: does not touch foreign files" || ko "install: does not touch foreign files"
 jq -e . "$S" >/dev/null 2>&1 && ok "install: valid settings after removal" || ko "install: valid settings after removal"
 
+# --- check-update ---------------------------------------------------------------------
+echo "== check-update =="
+CU="$HOME/.claude/hooks/check-update.sh"
+VF="$HOME/.claude/.nodiclaude-version"
+CF="$HOME/.claude/.nodiclaude-update-cache"
+BARE="$T/remote.git"
+CLONE="$T/clone"
+rm -rf "$BARE" "$CLONE" "$T/pusher"
+git init -q --bare -b main "$BARE"
+git clone -q "$BARE" "$CLONE" 2>/dev/null
+git -C "$CLONE" config user.name "Dev"
+git -C "$CLONE" config user.email "dev@x.io"
+git -C "$CLONE" checkout -q -b main 2>/dev/null
+(cd "$ROOT" && tar --exclude=.git -cf - .) | (cd "$CLONE" && tar -xf -)
+git -C "$CLONE" add -A
+git -C "$CLONE" commit -q -m "initial"
+git -C "$CLONE" push -q origin main 2>/dev/null
+H1="$(git -C "$CLONE" rev-parse HEAD)"
+
+# version file
+newhome
+git config --global user.name "T Est"
+git config --global user.email "t@x.io"
+inst "$CLONE/install.sh"
+check "version: install from clone rc" 0 "$RC"
+check "version: line 1 is HEAD" "$H1" "$(sed -n 1p "$VF")"
+check "version: line 2 is the origin URL" "$BARE" "$(sed -n 2p "$VF")"
+check "version: only two lines" 2 "$(wc -l < "$VF" | tr -d ' ')"
+grep -q "nodiclaude-version" "$HOME/.claude/.nodiclaude-manifest" && ko "version: not in the manifest" || ok "version: not in the manifest"
+git -C "$CLONE" remote set-url origin "https://user:secret@example.invalid/org/repo.git"
+inst "$CLONE/install.sh"
+check "version: credentials stripped" "https://example.invalid/org/repo.git" "$(sed -n 2p "$VF")"
+git -C "$CLONE" remote set-url origin "$BARE"
+# credential stripping
+newhome
+git config --global user.name "T Est"
+git config --global user.email "t@x.io"
+for pair in 'https://u:p@ss@host/x|https://host/x' 'git@github.com:o/r.git|git@github.com:o/r.git' 'https://github.com/o/r.git|https://github.com/o/r.git' 'https://tok@host/a@b|https://host/a@b'; do
+  git -C "$CLONE" remote set-url origin "${pair%%|*}"
+  inst "$CLONE/install.sh"
+  check "version: URL ${pair%%|*}" "${pair##*|}" "$(sed -n 2p "$VF")"
+done
+git -C "$CLONE" remote set-url origin "$BARE"
+newhome
+git config --global user.name "T Est"
+git config --global user.email "t@x.io"
+copyrepo
+inst "$T/repocopy/install.sh"
+check "version: non-git source rc" 0 "$RC"
+[ ! -e "$VF" ] && ok "version: no file when the source is not a git repo" || ko "version: no file when the source is not a git repo"
+echo "$OUT" | grep -q "version file not written" && ok "version: logs a note" || ko "version: logs a note" "$OUT"
+newhome
+inst "$CLONE/install.sh"
+check "version: failure rc" 1 "$RC"
+check "version: failure creates nothing" "." "$(tree_of)"
+
+# helpers
+newhome
+git config --global user.name "T Est"
+git config --global user.email "t@x.io"
+inst "$CLONE/install.sh"
+cu() { # cu <mode> -> CUOUT, CURC
+  CUOUT="$(bash "$CU" "$1" 2>/dev/null </dev/null)"
+  CURC=$?
+}
+
+# up to date
+cu session-start
+check "check-update: up to date rc" 0 "$CURC"
+check "check-update: up to date prints nothing" "" "$CUOUT"
+check "check-update: cache remote after session-start" "$H1" "$(grep '^remote=' "$CF" | cut -d= -f2)"
+grep -q '^checked=[0-9]' "$CF" && ok "check-update: cache has checked" || ko "check-update: cache has checked"
+
+# push a new commit
+git clone -q "$BARE" "$T/pusher" 2>/dev/null
+git -C "$T/pusher" config user.name "Dev"
+git -C "$T/pusher" config user.email "dev@x.io"
+echo more > "$T/pusher/new.txt"
+git -C "$T/pusher" add -A
+git -C "$T/pusher" commit -q -m "second"
+git -C "$T/pusher" push -q origin main 2>/dev/null
+H2="$(git -C "$T/pusher" rev-parse HEAD)"
+
+cu session-start
+check "check-update: outdated rc" 0 "$CURC"
+case "$CUOUT" in *"${H1:0:7}"*"${H2:0:7}"*"# rev: ${H2:0:7}"*) ok "check-update: notice has both hashes and # rev:" ;; *) ko "check-update: notice" "$CUOUT" ;; esac
+[ "$(printf '%s\n' "$CUOUT" | wc -l | tr -d ' ')" -le 3 ] && ok "check-update: notice is at most 3 lines" || ko "check-update: notice length"
+check "check-update: notified recorded" "$H2" "$(grep '^notified=' "$CF" | cut -d= -f2)"
+cu session-start
+case "$CUOUT" in *"outdated"*) ok "check-update: session-start notifies every time" ;; *) ko "check-update: session-start repeats" "$CUOUT" ;; esac
+
+# prompt: fresh cache, no network (URL replaced by a nonexistent path), already notified
+printf '%s\n%s\n' "$H1" "$T/does-not-exist.git" > "$VF"
+cu prompt
+check "check-update: prompt already notified => silent" "" "$CUOUT"
+check "check-update: prompt rc" 0 "$CURC"
+# new remote hash in the cache => notifies once, then not again
+sed -i.bak "s/^notified=.*/notified=/" "$CF" && rm -f "$CF.bak"
+cu prompt
+case "$CUOUT" in *"${H2:0:7}"*) ok "check-update: prompt notifies from the cache without network" ;; *) ko "check-update: prompt cached notice" "$CUOUT" ;; esac
+cu prompt
+check "check-update: prompt notifies once" "" "$CUOUT"
+
+# prompt: stale cache + unreachable URL => quick and silent
+sed -i.bak "s/^checked=.*/checked=1/;s/^notified=.*/notified=$H2/" "$CF" && rm -f "$CF.bak"
+t0="$(date +%s)"
+cu prompt
+t1="$(date +%s)"
+[ $((t1 - t0)) -lt 3 ] && ok "check-update: stale prompt returns quickly" || ko "check-update: stale prompt slow" "$((t1 - t0))s"
+check "check-update: stale prompt silent" "" "$CUOUT"
+check "check-update: stale prompt rc" 0 "$CURC"
+sleep 1
+grep -q '^checked=1$' "$CF" && ko "check-update: stale prompt marks checked (throttle)" || ok "check-update: stale prompt marks checked (throttle)"
+
+# prompt: no cache, reachable URL => refreshed in the background
+printf '%s\n%s\n' "$H1" "$BARE" > "$VF"
+rm -f "$CF"
+cu prompt
+check "check-update: prompt without cache silent" "" "$CUOUT"
+i=0
+while [ $i -lt 50 ] && ! grep -q "^remote=$H2" "$CF" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+grep -q "^remote=$H2" "$CF" && ok "check-update: background refresh updated the cache" || ko "check-update: background refresh" "$(cat "$CF" 2>/dev/null)"
+cu prompt
+case "$CUOUT" in *"${H2:0:7}"*) ok "check-update: prompt notifies after refresh" ;; *) ko "check-update: prompt after refresh" "$CUOUT" ;; esac
+
+# option injection through the stored URL
+INJ="$T/injected"
+rm -f "$INJ" "$CF"
+printf '%s\n%s\n' "$H1" "--upload-pack=touch $INJ" > "$VF"
+cu session-start
+check "check-update: option-like URL silent" "" "$CUOUT"
+check "check-update: option-like URL rc" 0 "$CURC"
+[ ! -e "$INJ" ] && ok "check-update: option-like URL runs nothing" || ko "check-update: option-like URL ran a command"
+# '--' guards the call itself too
+printf '%s\n%s\n' "$H1" " --upload-pack=touch $INJ" > "$VF"
+cu session-start
+[ ! -e "$INJ" ] && ok "check-update: leading-space option URL runs nothing" || ko "check-update: leading-space URL ran a command"
+
+# GIT_SSH_COMMAND: set when unset, kept when set (fake git records its environment)
+mkdir -p "$T/fakebin"
+printf '#!/usr/bin/env bash\nprintf "%%s" "${GIT_SSH_COMMAND-UNSET}" > "$FAKE_OUT"\nexit 1\n' > "$T/fakebin/git"
+chmod +x "$T/fakebin/git"
+printf '%s\n%s\n' "$H1" "$BARE" > "$VF"
+FAKE_OUT="$T/fake.out" PATH="$T/fakebin:$PATH" bash "$CU" session-start >/dev/null 2>&1 </dev/null
+check "check-update: GIT_SSH_COMMAND defaults to BatchMode" "ssh -o BatchMode=yes" "$(cat "$T/fake.out")"
+FAKE_OUT="$T/fake.out" GIT_SSH_COMMAND="ssh -i mykey" PATH="$T/fakebin:$PATH" bash "$CU" session-start >/dev/null 2>&1 </dev/null
+check "check-update: user GIT_SSH_COMMAND kept" "ssh -i mykey" "$(cat "$T/fake.out")"
+
+# silent failures
+printf '%s\n%s\n' "$H1" "$T/does-not-exist.git" > "$VF"
+rm -f "$CF"
+cu session-start
+check "check-update: unreachable URL silent" "" "$CUOUT"
+check "check-update: unreachable URL rc" 0 "$CURC"
+rm -f "$VF"
+cu session-start
+check "check-update: no version file silent" "" "$CUOUT"
+check "check-update: no version file rc" 0 "$CURC"
+cu prompt
+check "check-update: no version file prompt silent" "" "$CUOUT"
+printf '%s\n\n' "$H1" > "$VF"
+cu session-start
+check "check-update: empty URL silent" "" "$CUOUT"
+printf 'garbage\n%s\n' "$BARE" > "$VF"
+cu session-start
+check "check-update: bad installed hash silent" "" "$CUOUT"
+printf '%s\n%s\n' "$H1" "$BARE" > "$VF"
+printf 'checked=abc\nremote=zzz\nnotified=\x01\x02\n' > "$CF"
+cu prompt
+check "check-update: corrupt cache silent" "" "$CUOUT"
+check "check-update: corrupt cache rc" 0 "$CURC"
+cu bogus
+check "check-update: unknown mode silent" "" "$CUOUT"
+check "check-update: unknown mode rc" 0 "$CURC"
+
+# settings
+newhome
+git config --global user.name "T Est"
+git config --global user.email "t@x.io"
+inst "$ROOT/install.sh"
+check "settings: SessionStart command" '$HOME/.claude/hooks/check-update.sh session-start' "$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$S")"
+check "settings: UserPromptSubmit command" '$HOME/.claude/hooks/check-update.sh prompt' "$(jq -r '.hooks.UserPromptSubmit[0].hooks[0].command' "$S")"
+check "settings: PreToolUse still there" '$HOME/.claude/hooks/check-git-identity.sh' "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S")"
+check "settings: timeouts" "10:5" "$(jq -r '"\(.hooks.SessionStart[0].hooks[0].timeout):\(.hooks.UserPromptSubmit[0].hooks[0].timeout)"' "$S")"
+cp "$S" "$T/settings.run1"
+inst "$ROOT/install.sh"
+cmp -s "$S" "$T/settings.run1" && ok "settings: second run byte-identical" || ko "settings: second run byte-identical"
+check "settings: no duplicates" "1:1:1" "$(jq -r '"\(.hooks.PreToolUse|length):\(.hooks.SessionStart|length):\(.hooks.UserPromptSubmit|length)"' "$S")"
+copyrepo
+rm -f "$T/repocopy/hooks/check-update.sh"
+jq 'del(.hooks.SessionStart, .hooks.UserPromptSubmit)' "$T/repocopy/settings.json" > "$T/s.json" && cp "$T/s.json" "$T/repocopy/settings.json"
+bash "$T/repocopy/install.sh" >/dev/null 2>&1
+[ ! -e "$HOME/.claude/hooks/check-update.sh" ] && ok "settings: removed check-update.sh deleted" || ko "settings: removed check-update.sh deleted"
+grep -q "check-update" "$S" && ko "settings: removed hook entries dropped" "$(cat "$S")" || ok "settings: removed hook entries dropped"
+check "settings: other hooks kept after removal" '$HOME/.claude/hooks/check-git-identity.sh' "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S")"
+
 # --- consistency --------------------------------------------------------------------
 echo "== consistency =="
 for a in audit-auditor audit-verifier quest-implementer quest-reviewer; do
@@ -366,10 +562,11 @@ for a in audit-auditor audit-verifier quest-implementer quest-reviewer; do
   if [ -f "$f" ] && grep -q "^name: $a\$" "$f"; then ok "agent $a exists with matching name"; else ko "agent $a"; fi
   grep -rq "$a" "$ROOT/skills" && ok "agent $a is used by a skill" || ko "agent $a unused in skills"
 done
-for c in $(jq -r '.hooks[][].hooks[].command' "$ROOT/settings.json"); do
+while IFS= read -r c; do
+  c="${c%% *}" # script path, without arguments
   base="$(basename "$c")"
   [ -f "$ROOT/hooks/$base" ] && ok "registered hook $base exists in hooks/" || ko "registered hook $base does not exist"
-done
+done < <(jq -r '.hooks[][].hooks[].command' "$ROOT/settings.json")
 for f in "$ROOT"/install.sh "$ROOT"/hooks/*.sh "$ROOT"/tests/run.sh; do
   bash -n "$f" && ok "syntax $(basename "$f")" || ko "syntax $(basename "$f")"
 done

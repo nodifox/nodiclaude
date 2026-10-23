@@ -10,7 +10,7 @@ Recommended Claude Code configuration for this organization's projects: shared s
 ```
 skills/              # skills (skills/<name>/SKILL.md): audit, quest
 agents/              # subagents (agents/<name>.md) used by the skills
-hooks/               # hook scripts
+hooks/               # hook scripts: check-git-identity.sh, check-update.sh
 rules/               # user rules (rules/<name>.md) for Claude Code
 settings.json        # hook registration (merged into ~/.claude/settings.json)
 install.sh           # installs everything into $HOME/.claude (safe to run repeatedly)
@@ -23,6 +23,7 @@ Paste this into the environment's setup script and fill in the values at the top
 
 ```bash
 #!/usr/bin/env bash
+# rev: initial
 set -euo pipefail
 
 # Commit identity for this environment. The setup script does not receive the
@@ -55,7 +56,7 @@ bash "$DEST/install.sh"
 - **Why the values live in the script:** Claude Code on the web documents the environment variables as available to the session, not to the setup script, and a diagnostic run confirmed that `NODICLAUDE_*` variables set in the environment settings do not reach it. Cloud has no gitconfig, so without an identity `install.sh` fails without changing anything.
 - `install.sh` writes the identity into the global git config of the cloud VM (only the missing keys). The hook later falls back to that config, so sessions do not need the variables.
 - **Token:** the simplest option is a public repo (it contains no secrets), so `NODICLAUDE_GH_TOKEN` stays empty. If the repo is not public, set the token in the script: anyone who can edit or use the environment can read it, so keep it read-only and limited to this repo (Contents: read-only).
-- The setup result is cached by the platform (about 7 days) and is rebuilt when the script changes.
+- The setup result is cached by the platform (about 7 days) and is rebuilt when the script changes. Changing the `# rev: initial` line is enough to force that rebuild (re-clone and re-run); the update notice tells you which value to put there.
 
 ## Local install
 
@@ -81,6 +82,13 @@ The identity Claude must use is resolved as follows, both in `install.sh` and in
 3. If there is no source: `install.sh` fails (exit 1) without changing anything (not `~/.claude`, not the manifest, not the gitconfig); the hook warns and allows.
 
 With only one of the two variables, `install.sh` fails (set both or neither) and the hook warns and allows.
+
+## Updating
+
+- **Local:** `git pull && ./install.sh`.
+- **Cloud:** change the `# rev:` line in the environment's setup script to the hash the update notice shows, then start a new session.
+
+Open sessions do not reload rules or hooks, so a new session is needed after updating. In the cloud, the cached setup expires after about 7 days even if you forget to change `# rev:`.
 
 ## Adding a skill
 
@@ -112,6 +120,7 @@ Create `rules/<name>.md` (Markdown without frontmatter). It is copied to `~/.cla
 - **Manifest** (`~/.claude/.nodiclaude-manifest`): lists the installed files. On the next run, files that were in the manifest and are no longer in the repo are removed (along with empty directories under `skills/`; the manifest covers `skills/`, `agents/`, `hooks/` and `rules/`); if it was a hook, its entry is also removed from `settings.json`. Files that are not in the manifest are never touched.
 - **`settings.json` merge**: if it does not exist or is empty, it is copied. If it exists, it is merged with `jq`: the repo's hook entries replace existing ones with the same command (so a `matcher` change is applied without duplicating); for all other keys the existing value wins.
 - **`jq` is required** for merging. If it is missing, the script tries to install it (`apt-get`, `brew` or `apk`; with `sudo -n`). If that fails and `settings.json` already exists, it is left unmodified with a warning (merge it by hand). If `settings.json` is not valid JSON or has an unexpected structure, it is also left untouched with a warning, and the rest of the installation continues.
+- **Version file** (`~/.claude/.nodiclaude-version`): at the end of a successful run, if the repo is a git repo with a commit, it records the installed commit hash (line 1) and the URL of `origin` with any credentials stripped (line 2). It is state, not a repo file, so it is not in the manifest. If the repo is not a git repo, it is not written (a note is logged) and update checks stay disabled.
 - **Commit identity**: resolved at the start (see "Commit identity"); if it cannot be resolved, the script fails without changing anything. It reads the identity and records it in the log, and never overwrites existing `git config --global` keys. Only if the identity comes from the variables and the global config is missing `user.name` and/or `user.email`, it writes just the missing ones. If an existing key differs from the variable, it warns (`WARNING`) that the hook will block commits until they match and leaves it as is.
 
 ## Included skills
@@ -137,6 +146,16 @@ PreToolUse on `Bash`. If the command includes `git commit` (also chained with `&
 - `GIT_DIR=` / `git --git-dir=`;
 - `--reset-author`;
 - variables exported in a separate command (`export GIT_AUTHOR_NAME=x && git commit`).
+
+## The `check-update` hooks
+
+`hooks/check-update.sh` is registered on `SessionStart` (`check-update.sh session-start`) and `UserPromptSubmit` (`check-update.sh prompt`). It compares the installed commit (from `~/.claude/.nodiclaude-version`) with `refs/heads/main` of the stored remote URL (`git ls-remote`).
+
+- `SessionStart` always checks the remote (bounded to about 4 seconds) and notifies at every session start while outdated.
+- `UserPromptSubmit` only reads a local cache (`~/.claude/.nodiclaude-update-cache`) and refreshes it in the background at most once per hour; it notifies once per new remote version.
+- It only notifies: it never updates anything.
+- It stays silent (and exits 0) on any error: missing version file, no git, no network, bad data, or a remote that needs authentication (the stored URL has no credentials).
+- The notice is added to the conversation context, so it is kept short (3 lines).
 
 ## Tests
 

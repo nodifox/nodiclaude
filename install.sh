@@ -176,7 +176,7 @@ elif ensure_jq; then
       if (.hooks | type) == "object" then
         .hooks |= with_entries(
           if (.value | type) == "array" then
-            .value |= ([ .[] | .hooks |= (if type == "array" then map(select((.command // "" | endswith("/hooks/" + $name)) | not)) else . end) ]
+            .value |= ([ .[] | .hooks |= (if type == "array" then map(select((.command // "" | split(" ")[0] | endswith("/hooks/" + $name)) | not)) else . end) ]
                        | map(select((.hooks | type) != "array" or (.hooks | length) > 0)))
           else . end)
       else . end' "$SETTINGS"
@@ -217,6 +217,20 @@ else
       log "WARNING: git config --global user.$key is '$cur' and ${var} requires '$want'; not overwriting. The hook will block commits until they match."
     fi
   done
+fi
+
+# --- Version file ---------------------------------------------------------------------
+# State (not a repo file, not in the manifest) read by hooks/check-update.sh:
+# line 1 = installed commit, line 2 = URL of origin (credentials stripped).
+if [ -e "$REPO_DIR/.git" ] && head_hash="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" && [ -n "$head_hash" ]; then
+  origin_url="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
+  origin_url="$(printf '%s' "$origin_url" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@#\1#')"
+  vtmp="$(mktemp "$CLAUDE_DIR/.nodiclaude-version.XXXXXX")"
+  printf '%s\n%s\n' "$head_hash" "$origin_url" > "$vtmp"
+  mv -f "$vtmp" "$CLAUDE_DIR/.nodiclaude-version"
+  log "version file written (${head_hash:0:7})"
+else
+  log "note: $REPO_DIR is not a git repo with a commit; version file not written (update checks disabled)"
 fi
 
 log "installation complete"
