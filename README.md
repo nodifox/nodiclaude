@@ -190,7 +190,7 @@ PreToolUse on `Bash`. If the command includes `git commit` (also chained with `&
 `hooks/check-update.sh` is registered on `SessionStart` (`check-update.sh session-start`) and `UserPromptSubmit` (`check-update.sh prompt`). It compares the installed commit (from `~/.claude/.nodiclaude-version`) with `refs/heads/main` of the stored remote URL (`git ls-remote`).
 
 - `SessionStart` always checks the remote (bounded to about 4 seconds) and notifies at every session start while outdated.
-- `UserPromptSubmit` only reads a local cache (`~/.claude/.nodiclaude-update-cache`) and refreshes it in the background at most once per hour; it notifies once per new remote version.
+- `UserPromptSubmit` only reads a local cache (`~/.claude/.nodiclaude-update-cache`) and refreshes it in the background at most once per hour; it notifies once per new remote version. The cache is tied to the installed commit: it is ignored (and refreshed in the background) when the installed version changes.
 - It only notifies: it never updates anything.
 - It stays silent (and exits 0) on any error: missing version file, no git, no network, bad data, or a remote that needs authentication (the stored URL has no credentials).
 - The notice is added to the conversation context, so it is kept short (3 lines).
@@ -207,7 +207,7 @@ PreToolUse on `Bash`. If the command includes `git commit` (also chained with `&
 | `.nodiclaude-manifest` | List of installed files, used to remove files that left the repo. | Yes |
 | `.nodiclaude-backup/` | Copies of files replaced because they differed from the repo's. | Yes |
 | `.nodiclaude-version` | Installed commit and origin URL, read by the update check. | Yes |
-| `.nodiclaude-update-cache` | Last remote check, created by the `check-update` hook (not by `install.sh`). | Yes |
+| `.nodiclaude-update-cache` | Last remote check (installed commit, remote commit, last notified), created by the `check-update` hook (not by `install.sh`). | Yes |
 
 ## Troubleshooting
 

@@ -555,6 +555,49 @@ grep -q "^remote=$H2" "$CF" && ok "check-update: background refresh updated the 
 cu prompt
 case "$CUOUT" in *"${H2:0:7}"*) ok "check-update: prompt notifies after refresh" ;; *) ko "check-update: prompt after refresh" "$CUOUT" ;; esac
 
+# cache tied to the installed version
+waitcache() { # waitcache <pattern>: waits up to 5s for the cache to match
+  local n=0
+  while [ $n -lt 50 ] && ! grep -q "$1" "$CF" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
+}
+NOW="$(date +%s)"
+# (a) installed upgraded to the remote HEAD, old cache still fresh => silent, refreshed
+printf '%s\n%s\n' "$H2" "$BARE" > "$VF"
+printf 'installed=%s\nchecked=%s\nremote=%s\nnotified=\n' "$H1" "$NOW" "$H1" > "$CF"
+cu prompt
+check "check-update: stale-installed cache => prompt silent" "" "$CUOUT"
+waitcache "^remote=$H2"
+grep -q "^installed=$H2" "$CF" && grep -q "^remote=$H2" "$CF" && ok "check-update: invalid cache refreshed with installed= and remote=" || ko "check-update: invalid cache refresh" "$(cat "$CF" 2>/dev/null)"
+cu prompt
+check "check-update: after refresh prompt silent" "" "$CUOUT"
+# (b) the bug scenario: installed == remote HEAD, stale cache with a different remote
+printf 'installed=%s\nchecked=%s\nremote=%s\nnotified=\n' "$H1" "$NOW" "$H1" > "$CF"
+cu prompt
+check "check-update: bug scenario silent (1st prompt)" "" "$CUOUT"
+waitcache "^remote=$H2"
+cu prompt
+check "check-update: bug scenario silent (2nd prompt)" "" "$CUOUT"
+# (c) valid cache: notifies once per new remote hash, no network while fresh
+printf '%s\n%s\n' "$H1" "$T/does-not-exist.git" > "$VF"
+printf 'installed=%s\nchecked=%s\nremote=%s\nnotified=\n' "$H1" "$(date +%s)" "$H2" > "$CF"
+cu prompt
+case "$CUOUT" in *"${H2:0:7}"*) ok "check-update: valid cache notifies" ;; *) ko "check-update: valid cache notify" "$CUOUT" ;; esac
+cu prompt
+check "check-update: valid cache notifies once" "" "$CUOUT"
+grep -q "^installed=$H1" "$CF" && ok "check-update: installed= kept on rewrite" || ko "check-update: installed= kept" "$(cat "$CF")"
+# (d) old-format cache (no installed=) => invalid, silent, refreshed
+printf '%s\n%s\n' "$H1" "$BARE" > "$VF"
+printf 'checked=%s\nremote=%s\nnotified=\n' "$(date +%s)" "$H2" > "$CF"
+cu prompt
+check "check-update: old-format cache silent" "" "$CUOUT"
+waitcache "^remote=$H2"
+grep -q "^installed=$H1" "$CF" && grep -q "^remote=$H2" "$CF" && ok "check-update: old-format cache refreshed" || ko "check-update: old-format refresh" "$(cat "$CF")"
+# (e) session-start with an invalid cache whose notified equals the remote => still notifies
+printf 'checked=%s\nremote=%s\nnotified=%s\n' "$(date +%s)" "$H2" "$H2" > "$CF"
+cu session-start
+case "$CUOUT" in *"outdated"*) ok "check-update: session-start ignores stale notified" ;; *) ko "check-update: session-start stale notified" "$CUOUT" ;; esac
+grep -q "^installed=$H1" "$CF" && ok "check-update: session-start writes installed=" || ko "check-update: session-start installed=" "$(cat "$CF")"
+
 # option injection through the stored URL
 INJ="$T/injected"
 rm -f "$INJ" "$CF"
@@ -597,7 +640,7 @@ printf 'garbage\n%s\n' "$BARE" > "$VF"
 cu session-start
 check "check-update: bad installed hash silent" "" "$CUOUT"
 printf '%s\n%s\n' "$H1" "$BARE" > "$VF"
-printf 'checked=abc\nremote=zzz\nnotified=\x01\x02\n' > "$CF"
+printf 'installed=%s\nchecked=abc\nremote=zzz\nnotified=\x01\x02\n' "$H1" > "$CF"
 cu prompt
 check "check-update: corrupt cache silent" "" "$CUOUT"
 check "check-update: corrupt cache rc" 0 "$CURC"

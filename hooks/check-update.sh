@@ -18,17 +18,26 @@ LOOKUP_TICKS=40 # x 0.1s = 4 seconds
 
 HASH_RE='^[0-9a-f]{40,64}$'
 
-cache_get() { # cache_get <key>
+INSTALLED="" # set by main: the installed hash the cache must match
+
+cache_raw() { # cache_raw <key>
   [ -f "$CACHE_FILE" ] || return 0
   grep -m1 "^$1=" "$CACHE_FILE" 2>/dev/null | cut -d= -f2- | tr -d '\r\n'
   return 0
+}
+
+# cache_get <key>: the cache is only valid for the installed version it was computed
+# against; a missing or different installed= makes every value read as empty.
+cache_get() {
+  [ -n "$INSTALLED" ] && [ "$(cache_raw installed)" = "$INSTALLED" ] || return 0
+  cache_raw "$1"
 }
 
 # write_cache <checked> <remote> <notified>; atomic: temp file in the same dir + mv
 write_cache() {
   local t
   t="$(mktemp "$CLAUDE_DIR/.nodiclaude-cache.XXXXXX" 2>/dev/null)" || return 0
-  if printf 'checked=%s\nremote=%s\nnotified=%s\n' "$1" "$2" "$3" > "$t" 2>/dev/null; then
+  if printf 'installed=%s\nchecked=%s\nremote=%s\nnotified=%s\n' "$INSTALLED" "$1" "$2" "$3" > "$t" 2>/dev/null; then
     mv -f "$t" "$CACHE_FILE" 2>/dev/null || rm -f "$t"
   else
     rm -f "$t"
@@ -89,6 +98,7 @@ main() {
   [ -n "$url" ] || return 0
   case "$url" in -*) return 0 ;; esac # would be parsed as a git option
   printf '%s' "$installed" | grep -Eq "$HASH_RE" || return 0
+  INSTALLED="$installed"
   now="$(date +%s 2>/dev/null)"
   printf '%s' "$now" | grep -Eq '^[0-9]+$' || return 0
 
