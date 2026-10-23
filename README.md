@@ -19,34 +19,43 @@ tests/run.sh         # tests (hook, installer and consistency)
 
 ## Cloud environment setup
 
-Paste this into the environment's setup script (`GITHUB_OWNER` is the organization that owns this repo):
+Paste this into the environment's setup script and fill in the values at the top. `GITHUB_OWNER` is the organization that owns this repo.
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Commit identity for this environment. The setup script does not receive the
+# variables from the environment settings page, so define them here.
+export NODICLAUDE_GIT_NAME="Full Name"
+export NODICLAUDE_GIT_EMAIL="id+username@users.noreply.github.com"
+
+# Only needed if this repo is not public: fine-grained token, read-only on the repo.
+NODICLAUDE_GH_TOKEN=""
+
 GITHUB_OWNER="nodifox"
 REPO="nodiclaude"
 DEST="$(mktemp -d)"
+URL="https://github.com/${GITHUB_OWNER}/${REPO}.git"
 
-if [ -z "${NODICLAUDE_GH_TOKEN:-}" ]; then
-  echo "ERROR: NODICLAUDE_GH_TOKEN is not set. Configure it in the environment variables" >&2
-  echo "       (fine-grained token, read-only on ${GITHUB_OWNER}/${REPO})." >&2
-  exit 1
+if [ -n "$NODICLAUDE_GH_TOKEN" ]; then
+  # The token travels through environment variables (for this command only), not in the URL or argv.
+  GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0=http.extraheader \
+  GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$NODICLAUDE_GH_TOKEN" | base64 | tr -d '\n')" \
+    git clone --depth 1 --branch main "$URL" "$DEST"
+else
+  git clone --depth 1 --branch main "$URL" "$DEST"
 fi
-
-# The token travels through environment variables (for this command only), not in the URL or argv.
-GIT_CONFIG_COUNT=1 \
-GIT_CONFIG_KEY_0=http.extraheader \
-GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$NODICLAUDE_GH_TOKEN" | base64 | tr -d '\n')" \
-  git clone --depth 1 --branch main "https://github.com/${GITHUB_OWNER}/${REPO}.git" "$DEST"
 
 bash "$DEST/install.sh"
 ```
 
-The `main` branch is always cloned. Requires git >= 2.31 (for `GIT_CONFIG_COUNT`).
-
-Also define the environment variables (see Environment variables). Cloud has no gitconfig, so define `NODICLAUDE_GIT_NAME` and `NODICLAUDE_GIT_EMAIL` there: without them, `install.sh` fails without changing anything.
+- The `main` branch is always cloned. Requires git >= 2.31 (for `GIT_CONFIG_COUNT`).
+- **Why the values live in the script:** Claude Code on the web documents the environment variables as available to the session, not to the setup script, and a diagnostic run confirmed that `NODICLAUDE_*` variables set in the environment settings do not reach it. Cloud has no gitconfig, so without an identity `install.sh` fails without changing anything.
+- `install.sh` writes the identity into the global git config of the cloud VM (only the missing keys). The hook later falls back to that config, so sessions do not need the variables.
+- **Token:** the simplest option is a public repo (it contains no secrets), so `NODICLAUDE_GH_TOKEN` stays empty. If the repo is not public, set the token in the script: anyone who can edit or use the environment can read it, so keep it read-only and limited to this repo (Contents: read-only).
+- The setup result is cached by the platform (about 7 days) and is rebuilt when the script changes.
 
 ## Local install
 
@@ -54,11 +63,14 @@ Also define the environment variables (see Environment variables). Cloud has no 
 
 ## Environment variables
 
+Read by `install.sh` and by the hook:
+
 | Variable | Description |
 |---|---|
-| `NODICLAUDE_GH_TOKEN` | Fine-grained GitHub token, **read-only** (Contents: read) on `nodiclaude`. Needed to clone this repo, which is not public. |
 | `NODICLAUDE_GIT_NAME` | Name for commits. Only for environments without a gitconfig (cloud). Locally, `git config --global user.name` is used; if both exist, the variable wins. |
 | `NODICLAUDE_GIT_EMAIL` | Email for commits. Same as above (with `git config --global user.email`). Both variables must be set, or neither. |
+
+In the cloud, define them inside the setup script (see above). `NODICLAUDE_GH_TOKEN` is used only by that script, and only if the repo is not public.
 
 ### Commit identity
 
