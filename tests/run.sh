@@ -22,7 +22,7 @@ export GIT_CONFIG_NOSYSTEM=1
 mkdir -p "$HOME"
 : > "$GIT_CONFIG_GLOBAL"
 unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
-unset NODICLAUDE_GIT_NAME NODICLAUDE_GIT_EMAIL
+unset NODICLAUDE_GIT_NAME NODICLAUDE_GIT_EMAIL NODICLAUDE_ALLOW_ANY_BRANCH
 
 GOOD_NAME="Good Name"
 GOOD_EMAIL="good@example.com"
@@ -149,10 +149,20 @@ inst() { # inst <install.sh> -> OUT and RC
 }
 S="$HOME/.claude/settings.json"
 
+# MAIN: temp git copy of the repo with branch forced to main, so the suite does not depend on
+# the branch it is run from. Install tests run MAIN/install.sh.
+MAIN="$T/maincopy"
+mkdir -p "$MAIN"
+(cd "$ROOT" && tar --exclude=.git -cf - .) | (cd "$MAIN" && tar -xf -)
+git -C "$MAIN" init -q
+git -C "$MAIN" symbolic-ref HEAD refs/heads/main
+git -C "$MAIN" add -A
+git -C "$MAIN" -c user.name=T -c user.email=t@x.io commit -q -m initial
+
 newhome
 git config --global user.name "Prim Era"
 git config --global user.email "prim@x.io"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 check "install: first run" 0 "$RC"
 expected="$(cd "$ROOT" && find skills agents hooks rules -type f ! -name .DS_Store | LC_ALL=C sort)"
 actual="$(cd "$HOME/.claude" && find skills agents hooks rules -type f | LC_ALL=C sort)"
@@ -163,25 +173,25 @@ exec_ok=1
 for f in "$ROOT"/hooks/*.sh; do [ -x "$HOME/.claude/hooks/$(basename "$f")" ] || exec_ok=0; done
 check "install: executable hooks" 1 "$exec_ok"
 cp "$S" "$T/settings.run1"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 cmp -s "$S" "$T/settings.run1" && ok "install: second run identical" || ko "install: second run identical"
 echo "$OUT" | grep -q "backup" && ko "install: no backups if nothing changed" || ok "install: no backups if nothing changed"
 
 # commit identity
 tree_of() { (cd "$HOME" && find . 2>/dev/null | LC_ALL=C sort); }
 newhome
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 check "install: no identity => rc 1" 1 "$RC"
 echo "$OUT" | grep -q "ERROR" && echo "$OUT" | grep -q "NODICLAUDE_GIT_NAME" && echo "$OUT" | grep -q "git config --global" && ok "install: no identity explains the error" || ko "install: no identity explains the error" "$OUT"
 check "install: no identity creates nothing" "." "$(tree_of)"
 check "install: no identity does not touch gitconfig" "" "$(cat "$GIT_CONFIG_GLOBAL")"
 
 newhome
-NODICLAUDE_GIT_NAME="Only Name" inst "$ROOT/install.sh"
+NODICLAUDE_GIT_NAME="Only Name" inst "$MAIN/install.sh"
 check "install: only NAME => rc 1" 1 "$RC"
 echo "$OUT" | grep -q "Set both or neither" && ok "install: only NAME explains the error" || ko "install: only NAME explains the error" "$OUT"
 check "install: only NAME creates nothing" "." "$(tree_of)"
-NODICLAUDE_GIT_EMAIL="only@x.io" inst "$ROOT/install.sh"
+NODICLAUDE_GIT_EMAIL="only@x.io" inst "$MAIN/install.sh"
 check "install: only EMAIL => rc 1" 1 "$RC"
 check "install: only EMAIL creates nothing" "." "$(tree_of)"
 check "install: only one variable does not touch gitconfig" "" "$(cat "$GIT_CONFIG_GLOBAL")"
@@ -191,14 +201,14 @@ newhome
 git config --global user.name "Loc Al"
 git config --global user.email "loc@x.io"
 cp "$GIT_CONFIG_GLOBAL" "$T/gitconfig.before"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 check "install: global without variables rc" 0 "$RC"
 cmp -s "$GIT_CONFIG_GLOBAL" "$T/gitconfig.before" && ok "install: global without variables does not modify gitconfig" || ko "install: global without variables does not modify gitconfig"
 echo "$OUT" | grep -q "Loc Al" && ok "install: global without variables logs the identity" || ko "install: global without variables logs the identity" "$OUT"
 
 # cloud: variables and empty global config
 newhome
-NODICLAUDE_GIT_NAME="N Uno" NODICLAUDE_GIT_EMAIL="n@x.io" inst "$ROOT/install.sh"
+NODICLAUDE_GIT_NAME="N Uno" NODICLAUDE_GIT_EMAIL="n@x.io" inst "$MAIN/install.sh"
 check "install: variables and empty global rc" 0 "$RC"
 check "install: writes user.name" "N Uno" "$(git config --global user.name)"
 check "install: writes user.email" "n@x.io" "$(git config --global user.email)"
@@ -209,7 +219,7 @@ newhome
 git config --global user.name "Other Name"
 git config --global user.email "another@x.io"
 cp "$GIT_CONFIG_GLOBAL" "$T/gitconfig.before"
-NODICLAUDE_GIT_NAME="N Dos" NODICLAUDE_GIT_EMAIL="n2@x.io" inst "$ROOT/install.sh"
+NODICLAUDE_GIT_NAME="N Dos" NODICLAUDE_GIT_EMAIL="n2@x.io" inst "$MAIN/install.sh"
 check "install: variables and different global rc" 0 "$RC"
 cmp -s "$GIT_CONFIG_GLOBAL" "$T/gitconfig.before" && ok "install: different global is not modified" || ko "install: different global is not modified"
 echo "$OUT" | grep -q "WARNING.*user.name" && echo "$OUT" | grep -q "WARNING.*user.email" && ok "install: different global warns" || ko "install: different global warns" "$OUT"
@@ -221,14 +231,14 @@ newhome
 git config --global user.name "N Tres"
 git config --global user.email "n3@x.io"
 cp "$GIT_CONFIG_GLOBAL" "$T/gitconfig.before"
-NODICLAUDE_GIT_NAME="N Tres" NODICLAUDE_GIT_EMAIL="n3@x.io" inst "$ROOT/install.sh"
+NODICLAUDE_GIT_NAME="N Tres" NODICLAUDE_GIT_EMAIL="n3@x.io" inst "$MAIN/install.sh"
 cmp -s "$GIT_CONFIG_GLOBAL" "$T/gitconfig.before" && ok "install: same global unchanged" || ko "install: same global unchanged"
 echo "$OUT" | grep -q "WARNING.*user\." && ko "install: same global does not warn" "$OUT" || ok "install: same global does not warn"
 
 # cloud: partial global => only the missing key is written
 newhome
 git config --global user.name "Partial"
-NODICLAUDE_GIT_NAME="Another" NODICLAUDE_GIT_EMAIL="p@x.io" inst "$ROOT/install.sh"
+NODICLAUDE_GIT_NAME="Another" NODICLAUDE_GIT_EMAIL="p@x.io" inst "$MAIN/install.sh"
 check "install: partial global keeps name" "Partial" "$(git config --global user.name)"
 check "install: partial global writes email" "p@x.io" "$(git config --global user.email)"
 
@@ -240,21 +250,21 @@ mkdir -p "$HOME/.claude"
 cat > "$S" <<'JSON'
 {"model":"opus","hooks":{"PreToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"/other/hook.sh"}]},{"matcher":"Read","hooks":[{"type":"command","command":"$HOME/.claude/hooks/check-git-identity.sh"}]}],"Stop":[{"hooks":[{"type":"command","command":"/stop.sh"}]}]}}
 JSON
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 check "install: existing settings rc" 0 "$RC"
 check "install: keeps other keys" "opus" "$(jq -r .model "$S")"
 check "install: keeps other hooks" "/other/hook.sh" "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S")"
 check "install: keeps foreign events" "/stop.sh" "$(jq -r '.hooks.Stop[0].hooks[0].command' "$S")"
 check "install: matcher change without duplicating" "1:Bash" "$(jq -r '[.hooks.PreToolUse[] | select(.hooks[0].command | endswith("check-git-identity.sh"))] | "\(length):\(.[0].matcher)"' "$S")"
 cp "$S" "$T/settings.run1"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 cmp -s "$S" "$T/settings.run1" && ok "install: idempotent merge" || ko "install: idempotent merge"
 
 # invalid settings
 newhome
 mkdir -p "$HOME/.claude"
 echo '{ not json' > "$S"
-NODICLAUDE_GIT_NAME="Inv" NODICLAUDE_GIT_EMAIL="inv@x.io" inst "$ROOT/install.sh"
+NODICLAUDE_GIT_NAME="Inv" NODICLAUDE_GIT_EMAIL="inv@x.io" inst "$MAIN/install.sh"
 check "install: invalid settings rc" 0 "$RC"
 echo "$OUT" | grep -q "WARNING" && ok "install: invalid settings warns" || ko "install: invalid settings warns"
 check "install: invalid settings untouched" '{ not json' "$(cat "$S")"
@@ -266,7 +276,7 @@ git config --global user.name "T Est"
 git config --global user.email "t@x.io"
 mkdir -p "$HOME/.claude"
 echo '{"hooks":{"PreToolUse":"weird"}}' > "$S"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 check "install: non-array PreToolUse rc" 0 "$RC"
 check "install: non-array PreToolUse untouched" '{"hooks":{"PreToolUse":"weird"}}' "$(cat "$S")"
 
@@ -277,7 +287,7 @@ git config --global user.email "t@x.io"
 mkdir -p "$HOME/.claude"
 echo '{"model":"x"}' > "$T/real-settings.json"
 ln -s "$T/real-settings.json" "$S"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 [ -L "$S" ] && ok "install: settings is still a symlink" || ko "install: settings is still a symlink"
 check "install: wrote to the symlink target" "Bash" "$(jq -r '.hooks.PreToolUse[0].matcher' "$T/real-settings.json")"
 
@@ -285,9 +295,9 @@ check "install: wrote to the symlink target" "Bash" "$(jq -r '.hooks.PreToolUse[
 newhome
 git config --global user.name "T Est"
 git config --global user.email "t@x.io"
-bash "$ROOT/install.sh" >/dev/null 2>&1
+bash "$MAIN/install.sh" >/dev/null 2>&1
 echo "# modified" >> "$HOME/.claude/agents/audit-auditor.md"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 bk="$(find "$HOME/.claude/.nodiclaude-backup" -type f -name audit-auditor.md 2>/dev/null | head -1)"
 [ -n "$bk" ] && grep -q "# modified" "$bk" && ok "install: backup of the modified destination" || ko "install: backup of the modified destination"
 cmp -s "$ROOT/agents/audit-auditor.md" "$HOME/.claude/agents/audit-auditor.md" && ok "install: destination restored" || ko "install: destination restored"
@@ -299,16 +309,16 @@ git config --global user.email "t@x.io"
 mkdir -p "$HOME/.claude/agents"
 echo "mine" > "$T/mine.md"
 ln -s "$T/mine.md" "$HOME/.claude/agents/audit-auditor.md"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 echo "$OUT" | grep -q "symlink" && [ "$(cat "$T/mine.md")" = "mine" ] && ok "install: symlink destination skipped" || ko "install: symlink destination skipped"
 
 # manifest entry that is a directory
 newhome
-NODICLAUDE_GIT_NAME="Dir" NODICLAUDE_GIT_EMAIL="dir@x.io" bash "$ROOT/install.sh" >/dev/null 2>&1
+NODICLAUDE_GIT_NAME="Dir" NODICLAUDE_GIT_EMAIL="dir@x.io" bash "$MAIN/install.sh" >/dev/null 2>&1
 mkdir -p "$HOME/.claude/hooks/dir"
 printf 'hooks/dir\n' >> "$HOME/.claude/.nodiclaude-manifest"
 rm -f "$S"
-NODICLAUDE_GIT_NAME="Dir" NODICLAUDE_GIT_EMAIL="dir@x.io" inst "$ROOT/install.sh"
+NODICLAUDE_GIT_NAME="Dir" NODICLAUDE_GIT_EMAIL="dir@x.io" inst "$MAIN/install.sh"
 check "install: directory in manifest rc" 0 "$RC"
 [ -d "$HOME/.claude/hooks/dir" ] && ok "install: manifest directory untouched" || ko "install: manifest directory untouched"
 jq -e '.hooks.PreToolUse' "$S" >/dev/null 2>&1 && ok "install: settings created after directory in manifest" || ko "install: settings after directory in manifest"
@@ -318,13 +328,13 @@ check "install: identity after directory in manifest" "Dir" "$(git config --glob
 newhome
 git config --global user.name "T Est"
 git config --global user.email "t@x.io"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 cmp -s "$ROOT/rules/git-commits.md" "$HOME/.claude/rules/git-commits.md" && ok "install: rules/git-commits.md installed" || ko "install: rules/git-commits.md installed"
 grep -Fxq "rules/git-commits.md" "$HOME/.claude/.nodiclaude-manifest" && ok "install: the rule is in the manifest" || ko "install: the rule is in the manifest"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 echo "$OUT" | grep -q "(0 files copied)" && ok "install: second run copies 0 files" || ko "install: second run copies 0 files" "$OUT"
 echo "# modified" >> "$HOME/.claude/rules/git-commits.md"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 bk="$(find "$HOME/.claude/.nodiclaude-backup" -type f -name git-commits.md 2>/dev/null | head -1)"
 [ -n "$bk" ] && grep -q "# modified" "$bk" && ok "install: backup of the modified rule" || ko "install: backup of the modified rule"
 cmp -s "$ROOT/rules/git-commits.md" "$HOME/.claude/rules/git-commits.md" && ok "install: rule restored" || ko "install: rule restored"
@@ -333,7 +343,7 @@ rm -f "$T/repocopy/rules/git-commits.md"
 bash "$T/repocopy/install.sh" >/dev/null 2>&1
 [ ! -e "$HOME/.claude/rules/git-commits.md" ] && ok "install: removed rule deleted" || ko "install: removed rule deleted"
 newhome
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 [ ! -e "$HOME/.claude/rules" ] && ok "install: no identity does not create rules/" || ko "install: no identity does not create rules/"
 
 # removal of retired files (on a copy of the repo)
@@ -358,6 +368,67 @@ bash "$T/repocopy/install.sh" >/dev/null 2>&1
 grep -q extra.sh "$S" && ko "install: removed hook entry in settings" || ok "install: removed hook entry dropped from settings"
 [ -f "$HOME/.claude/skills/foreign.md" ] && ok "install: does not touch foreign files" || ko "install: does not touch foreign files"
 jq -e . "$S" >/dev/null 2>&1 && ok "install: valid settings after removal" || ko "install: valid settings after removal"
+
+# source branch check
+BR="$T/branchcopy"
+rm -rf "$BR"; cp -R "$MAIN" "$BR"
+newhome
+git config --global user.name "T Est"
+git config --global user.email "t@x.io"
+inst "$BR/install.sh"
+check "branch: on main installs" 0 "$RC"
+git -C "$BR" checkout -q -b dev
+newhome
+git config --global user.name "T Est"
+git config --global user.email "t@x.io"
+inst "$BR/install.sh"
+check "branch: other branch => rc 1" 1 "$RC"
+echo "$OUT" | grep -q "ERROR" && echo "$OUT" | grep -q "'dev'" && echo "$OUT" | grep -q "NODICLAUDE_ALLOW_ANY_BRANCH" && ok "branch: message names branch and escape" || ko "branch: message names branch and escape" "$OUT"
+check "branch: other branch creates nothing" "." "$(tree_of)"
+NODICLAUDE_ALLOW_ANY_BRANCH=1 inst "$BR/install.sh"
+check "branch: escape installs" 0 "$RC"
+echo "$OUT" | grep -q "WARNING.*'dev'" && ok "branch: escape logs WARNING" || ko "branch: escape logs WARNING" "$OUT"
+git -C "$BR" checkout -q --detach
+newhome
+git config --global user.name "T Est"
+git config --global user.email "t@x.io"
+inst "$BR/install.sh"
+check "branch: detached HEAD => rc 1" 1 "$RC"
+echo "$OUT" | grep -q "detached HEAD" && ok "branch: detached message" || ko "branch: detached message" "$OUT"
+check "branch: detached HEAD creates nothing" "." "$(tree_of)"
+NODICLAUDE_ALLOW_ANY_BRANCH=1 inst "$BR/install.sh"
+check "branch: escape on detached HEAD installs" 0 "$RC"
+newhome
+git config --global user.name "T Est"
+git config --global user.email "t@x.io"
+copyrepo
+inst "$T/repocopy/install.sh"
+check "branch: no .git installs" 0 "$RC"
+echo "$OUT" | grep -q "branch check skipped" && ok "branch: no .git logs skipped note" || ko "branch: no .git logs skipped note" "$OUT"
+newhome
+inst "$BR/install.sh"
+check "branch: identity failure still rc 1" 1 "$RC"
+echo "$OUT" | grep -q "could not determine Claude's commit identity" && ok "branch: identity failure still reported" || ko "branch: identity failure still reported" "$OUT"
+check "branch: identity failure creates nothing" "." "$(tree_of)"
+
+# tag named main, and branch named heads/main
+TG="$T/tagcopy"
+rm -rf "$TG"; cp -R "$MAIN" "$TG"
+git -C "$TG" tag main
+newhome
+git config --global user.name "T Est"
+git config --global user.email "t@x.io"
+inst "$TG/install.sh"
+check "branch: on main with a tag named main installs" 0 "$RC"
+if git -C "$TG" checkout -q -b heads/main 2>/dev/null; then
+  newhome
+  git config --global user.name "T Est"
+  git config --global user.email "t@x.io"
+  inst "$TG/install.sh"
+  check "branch: branch named heads/main => rc 1" 1 "$RC"
+  echo "$OUT" | grep -q "'heads/main'" && ok "branch: heads/main reported as such" || ko "branch: heads/main reported as such" "$OUT"
+  check "branch: heads/main creates nothing" "." "$(tree_of)"
+fi
 
 # --- check-update ---------------------------------------------------------------------
 echo "== check-update =="
@@ -538,13 +609,13 @@ check "check-update: unknown mode rc" 0 "$CURC"
 newhome
 git config --global user.name "T Est"
 git config --global user.email "t@x.io"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 check "settings: SessionStart command" '$HOME/.claude/hooks/check-update.sh session-start' "$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$S")"
 check "settings: UserPromptSubmit command" '$HOME/.claude/hooks/check-update.sh prompt' "$(jq -r '.hooks.UserPromptSubmit[0].hooks[0].command' "$S")"
 check "settings: PreToolUse still there" '$HOME/.claude/hooks/check-git-identity.sh' "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S")"
 check "settings: timeouts" "10:5" "$(jq -r '"\(.hooks.SessionStart[0].hooks[0].timeout):\(.hooks.UserPromptSubmit[0].hooks[0].timeout)"' "$S")"
 cp "$S" "$T/settings.run1"
-inst "$ROOT/install.sh"
+inst "$MAIN/install.sh"
 cmp -s "$S" "$T/settings.run1" && ok "settings: second run byte-identical" || ko "settings: second run byte-identical"
 check "settings: no duplicates" "1:1:1" "$(jq -r '"\(.hooks.PreToolUse|length):\(.hooks.SessionStart|length):\(.hooks.UserPromptSubmit|length)"' "$S")"
 copyrepo
@@ -554,6 +625,42 @@ bash "$T/repocopy/install.sh" >/dev/null 2>&1
 [ ! -e "$HOME/.claude/hooks/check-update.sh" ] && ok "settings: removed check-update.sh deleted" || ko "settings: removed check-update.sh deleted"
 grep -q "check-update" "$S" && ko "settings: removed hook entries dropped" "$(cat "$S")" || ok "settings: removed hook entries dropped"
 check "settings: other hooks kept after removal" '$HOME/.claude/hooks/check-git-identity.sh' "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S")"
+
+# --- README cloud setup script -----------------------------------------------------
+echo "== readme cloud setup script =="
+SNIP="$T/cloud-setup.sh"
+awk '
+  /^## Cloud environment setup/ { in_sec = 1; next }
+  in_sec && /^## / { exit }
+  in_sec && !done && /^```bash[[:space:]]*$/ { in_blk = 1; next }
+  in_blk && /^```[[:space:]]*$/ { in_blk = 0; done = 1; next }
+  in_blk { print }
+' "$ROOT/README.md" > "$SNIP"
+[ -s "$SNIP" ] && ok "readme: cloud setup block extracted" || ko "readme: cloud setup block extracted"
+bash -n "$SNIP" && ok "readme: cloud setup script is valid bash" || ko "readme: cloud setup script is valid bash"
+for pat in '--branch main' '^# rev:' '^export NODICLAUDE_GIT_NAME=' '^export NODICLAUDE_GIT_EMAIL=' 'NODICLAUDE_GH_TOKEN' '\$DEST/install\.sh'; do
+  grep -q -- "$pat" "$SNIP" && ok "readme: cloud setup script contains $pat" || ko "readme: cloud setup script contains $pat"
+done
+# Dry run against a local repo standing in for the remote (copy of the snippet, test values).
+newhome
+BARE="$T/remote.git"
+rm -rf "$BARE"
+git clone -q --bare "$MAIN" "$BARE"
+sed -e "s#^URL=.*#URL=\"file://$BARE\"#" \
+    -e 's#^export NODICLAUDE_GIT_NAME=.*#export NODICLAUDE_GIT_NAME="Cloud Test"#' \
+    -e 's#^export NODICLAUDE_GIT_EMAIL=.*#export NODICLAUDE_GIT_EMAIL="cloud@x.io"#' \
+    "$SNIP" > "$T/cloud-setup.test.sh"
+if grep -q "^URL=\"file://$BARE\"" "$T/cloud-setup.test.sh"; then
+  ok "readme: dry run URL substituted with local repo"
+  OUT="$(bash "$T/cloud-setup.test.sh" 2>&1)"
+  RC=$?
+  check "readme: cloud setup dry run exits 0" 0 "$RC"
+  [ -f "$HOME/.claude/rules/git-commits.md" ] && ok "readme: cloud setup dry run installs rules/git-commits.md" || ko "readme: cloud setup dry run installs rules/git-commits.md" "$OUT"
+  check "readme: cloud setup dry run writes identity" "Cloud Test" "$(git config --global user.name)"
+else
+  ko "readme: dry run URL substituted with local repo"
+  echo "SKIP: cloud setup dry run not executed (URL substitution failed)"
+fi
 
 # --- consistency --------------------------------------------------------------------
 echo "== consistency =="

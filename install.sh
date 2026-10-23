@@ -47,6 +47,27 @@ else
   fi
 fi
 
+# --- Source branch ------------------------------------------------------------------
+# Also resolved BEFORE touching anything. Installing is only allowed from `main`, because
+# the update notice compares the installed commit with main. Escape: NODICLAUDE_ALLOW_ANY_BRANCH.
+if [ -e "$REPO_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+  ref="$(git -C "$REPO_DIR" symbolic-ref -q HEAD 2>/dev/null || true)"
+  branch="${ref#refs/heads/}"
+  if [ "$branch" != "main" ]; then
+    if [ -n "$branch" ]; then branch_desc="branch '$branch'"; else branch_desc="detached HEAD"; fi
+    if [ -n "${NODICLAUDE_ALLOW_ANY_BRANCH:-}" ]; then
+      log "WARNING: installing from $branch_desc (NODICLAUDE_ALLOW_ANY_BRANCH is set); the update notice may report a false 'outdated'."
+    else
+      echo "[nodiclaude] ERROR: refusing to install from $branch_desc; switch to main first (git switch main)." >&2
+      echo "             To install from another branch anyway, set NODICLAUDE_ALLOW_ANY_BRANCH=1." >&2
+      echo "             Nothing has been changed." >&2
+      exit 1
+    fi
+  fi
+else
+  log "note: $REPO_DIR is not a git repo (or git is missing); branch check skipped"
+fi
+
 mkdir -p "$CLAUDE_DIR/skills" "$CLAUDE_DIR/agents" "$CLAUDE_DIR/hooks" "$CLAUDE_DIR/rules"
 
 # --- jq ----------------------------------------------------------------------
