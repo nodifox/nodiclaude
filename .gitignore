@@ -1,0 +1,13 @@
+# Debug
+*.log
+*.tmp
+
+# Environment
+.env
+.env.*
+
+# Claude
+.claude/settings.local.json
+
+# Misc
+.DS_Store

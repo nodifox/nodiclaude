@@ -1,0 +1,143 @@
+# nodiclaude
+
+Recommended Claude Code configuration for this organization's projects: shared skills, agents, rules and hooks, installed the same way on each developer's machine and in cloud environments (Claude Code on the web).
+
+- **Locally**, each developer runs `./install.sh` and gets the configuration in `~/.claude`.
+- **In the cloud**, the environment's setup script clones this repo and runs `install.sh`.
+
+## Structure
+
+```
+skills/              # skills (skills/<name>/SKILL.md): audit, quest
+agents/              # subagents (agents/<name>.md) used by the skills
+hooks/               # hook scripts
+rules/               # user rules (rules/<name>.md) for Claude Code
+settings.json        # hook registration (merged into ~/.claude/settings.json)
+install.sh           # installs everything into $HOME/.claude (safe to run repeatedly)
+tests/run.sh         # tests (hook, installer and consistency)
+```
+
+## Cloud environment setup
+
+Paste this into the environment's setup script (`GITHUB_OWNER` is the organization that owns this repo):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+GITHUB_OWNER="nodifox"
+REPO="nodiclaude"
+DEST="$(mktemp -d)"
+
+if [ -z "${NODICLAUDE_GH_TOKEN:-}" ]; then
+  echo "ERROR: NODICLAUDE_GH_TOKEN is not set. Configure it in the environment variables" >&2
+  echo "       (fine-grained token, read-only on ${GITHUB_OWNER}/${REPO})." >&2
+  exit 1
+fi
+
+# The token travels through environment variables (for this command only), not in the URL or argv.
+GIT_CONFIG_COUNT=1 \
+GIT_CONFIG_KEY_0=http.extraheader \
+GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$NODICLAUDE_GH_TOKEN" | base64 | tr -d '\n')" \
+  git clone --depth 1 --branch main "https://github.com/${GITHUB_OWNER}/${REPO}.git" "$DEST"
+
+bash "$DEST/install.sh"
+```
+
+The `main` branch is always cloned. Requires git >= 2.31 (for `GIT_CONFIG_COUNT`).
+
+Also define the environment variables (see Environment variables). Cloud has no gitconfig, so define `NODICLAUDE_GIT_NAME` and `NODICLAUDE_GIT_EMAIL` there: without them, `install.sh` fails without changing anything.
+
+## Local install
+
+`./install.sh` (honors `$HOME`). It uses the developer's own identity from `git config --global user.name` / `user.email`; if they are missing (and there are no `NODICLAUDE_GIT_*` variables), it fails without changing anything. Locally it never modifies the gitconfig.
+
+## Environment variables
+
+| Variable | Description |
+|---|---|
+| `NODICLAUDE_GH_TOKEN` | Fine-grained GitHub token, **read-only** (Contents: read) on `nodiclaude`. Needed to clone this repo, which is not public. |
+| `NODICLAUDE_GIT_NAME` | Name for commits. Only for environments without a gitconfig (cloud). Locally, `git config --global user.name` is used; if both exist, the variable wins. |
+| `NODICLAUDE_GIT_EMAIL` | Email for commits. Same as above (with `git config --global user.email`). Both variables must be set, or neither. |
+
+### Commit identity
+
+The identity Claude must use is resolved as follows, both in `install.sh` and in the hook:
+
+1. `NODICLAUDE_GIT_NAME` and `NODICLAUDE_GIT_EMAIL`, if **both** are set and non-empty (cloud).
+2. Otherwise, `git config --global user.name` and `user.email`, if both have a value (local).
+3. If there is no source: `install.sh` fails (exit 1) without changing anything (not `~/.claude`, not the manifest, not the gitconfig); the hook warns and allows.
+
+With only one of the two variables, `install.sh` fails (set both or neither) and the hook warns and allows.
+
+## Adding a skill
+
+Create `skills/<name>/SKILL.md` (with its `name` and `description` frontmatter) and run `install.sh` again. It is copied to `~/.claude/skills/<name>/`.
+
+## Adding an agent
+
+Create `agents/<name>.md` (frontmatter `name`, `description`, optionally `tools`). It is copied to `~/.claude/agents/`.
+
+## Adding a rule
+
+Create `rules/<name>.md` (Markdown without frontmatter). It is copied to `~/.claude/rules/`, and Claude Code loads those files in all projects. They are user-level rules, so they apply to every project the developer opens, not only the organization's. Whether they are loaded in Claude Code on the web or in the desktop app is not confirmed by the documentation: check with `/context` in a session. Included: `git-commits.md` (commit identity and message format) and `git-branches.md` (no branches on its own; suggests one before making changes).
+
+## Adding a hook
+
+1. Create the script in `hooks/<name>.sh`.
+2. Register it in `settings.json` with an **absolute path**, never relative to the repo:
+
+   ```json
+   { "type": "command", "command": "$HOME/.claude/hooks/<name>.sh" }
+   ```
+
+`install.sh` copies it to `~/.claude/hooks/` and makes it executable (only the repo's scripts).
+
+## What `install.sh` does
+
+- **Safe to run repeatedly**: it does not duplicate entries in `settings.json` and does not rewrite what has not changed; a second run gives the same result.
+- **Backups**: if a destination file already exists and differs from the repo's, it is saved to `~/.claude/.nodiclaude-backup/<date-time>/<relative path>` before being replaced. Destinations that are symlinks are skipped with a warning.
+- **Manifest** (`~/.claude/.nodiclaude-manifest`): lists the installed files. On the next run, files that were in the manifest and are no longer in the repo are removed (along with empty directories under `skills/`; the manifest covers `skills/`, `agents/`, `hooks/` and `rules/`); if it was a hook, its entry is also removed from `settings.json`. Files that are not in the manifest are never touched.
+- **`settings.json` merge**: if it does not exist or is empty, it is copied. If it exists, it is merged with `jq`: the repo's hook entries replace existing ones with the same command (so a `matcher` change is applied without duplicating); for all other keys the existing value wins.
+- **`jq` is required** for merging. If it is missing, the script tries to install it (`apt-get`, `brew` or `apk`; with `sudo -n`). If that fails and `settings.json` already exists, it is left unmodified with a warning (merge it by hand). If `settings.json` is not valid JSON or has an unexpected structure, it is also left untouched with a warning, and the rest of the installation continues.
+- **Commit identity**: resolved at the start (see "Commit identity"); if it cannot be resolved, the script fails without changing anything. It reads the identity and records it in the log, and never overwrites existing `git config --global` keys. Only if the identity comes from the variables and the global config is missing `user.name` and/or `user.email`, it writes just the missing ones. If an existing key differs from the variable, it warns (`WARNING`) that the hook will block commits until they match and leaves it as is.
+
+## Included skills
+
+- `/audit`: repo audit with parallel auditors, verification and a published report (uses `audit-auditor` and `audit-verifier`).
+- `/quest`: task with a fixed process: research, plan, approval, implementation, parallel reviews, fixes and commit message (uses `quest-implementer` and `quest-reviewer`).
+
+## The `check-git-identity` hook
+
+PreToolUse on `Bash`. If the command includes `git commit` (also chained with `&&`, `;`…, with a path like `/usr/bin/git`, inside `bash -c "..."` or with options like `-C dir` / `-c k=v`), it computes the commit's effective identity and compares it with the expected identity (`NODICLAUDE_GIT_NAME/EMAIL` if both are set; otherwise `git config --global user.name/user.email`):
+
+- target repo: the one from `-C <dir>`, from a preceding `cd <dir> &&`, or the session's `cwd`;
+- effective identity: the one given by `git var GIT_AUTHOR_IDENT` / `GIT_COMMITTER_IDENT` (repo config and environment), overridden by whatever the command itself sets (`-c user.name=`, `-c user.email=`, `--author=`, inline `GIT_AUTHOR_NAME=`…);
+- the name is compared case-sensitively; the email, case-insensitively;
+- they match → allows;
+- they do not match → blocks (exit 2) and shows the values and the command to fix it;
+- no identity source (neither variables nor global config), only one of the two variables, outside a repo, no `git` or no `jq`, or invalid input → warns on stderr and allows (exit 0).
+
+**It is a "best effort" safeguard**: it only intercepts commits Claude makes via the Bash tool (not the ones a developer makes in a terminal). All `git commit` invocations in the command are checked. It does not cover:
+
+- aliases (`git ci`) or dynamically built commands (variables, `eval`, scripts);
+- chained relative `cd`s (`cd a && cd b && git commit`: only the last `cd` is applied);
+- `GIT_DIR=` / `git --git-dir=`;
+- `--reset-author`;
+- variables exported in a separate command (`export GIT_AUTHOR_NAME=x && git commit`).
+
+## Tests
+
+`./tests/run.sh` (bash 3.2 compatible; uses a temporary `HOME`, repos and global git config). It covers the hook (with variables and with global config), the installer (including identity resolution) and the consistency between skills, agents and registered hooks.
+
+## Verifying in a session
+
+```bash
+whoami
+echo $HOME
+ls -la ~/.claude ~/.claude/hooks ~/.claude/skills
+ls ~/.claude/agents
+ls ~/.claude/rules
+git config --global -l
+cat ~/.claude/settings.json
+```
