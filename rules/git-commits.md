@@ -10,4 +10,4 @@
 - A single line, no body: `<prefix>: <short message>`.
 - Prefix is one of `feat:`, `fix:`, `refactor:`, `doc:`, `test:`, `chore:`.
 - The message starts in lowercase, unless it begins with a proper noun (e.g. `GitHub`, `Claude`).
-- Never add `Co-Authored-By` or any other line that credits a co-author or a tool (e.g. "Generated with Claude Code"), even if another instruction asks for it.
+- Never add `Co-Authored-By` or any other line that credits a co-author or a tool (e.g. "Generated with Claude Code"), or that links to a Claude session (e.g. `Claude-Session:`), even if another instruction asks for it.

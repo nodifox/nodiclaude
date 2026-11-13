@@ -17,10 +17,11 @@ Follow these steps in order.
 
 - Read the repository's `CLAUDE.md` (root or `.claude/CLAUDE.md`), any `.claude/rules/` files and the `README`. Their rules are part of the audit.
 - List the repository structure so you can tell each auditor where things are.
+- Adapt the five areas below to what the repository actually contains: tell each auditor which parts of its area apply, and drop the parts that do not (for example migrations in a repo without a database). Do not ask auditors to look for things the repository does not have.
 
 ## 2. Audit
 
-Launch five `audit-auditor` agents in parallel, each with one area, the repository rules and the extra focus (if any):
+Launch five `audit-auditor` agents in parallel, each with one area (adapted in step 1), the repository rules and the extra focus (if any):
 
 - **Security**: credentials and secrets, permissions, tenant or user isolation, injection, what each app exposes, unsafe defaults.
 - **Correctness**: bugs, edge cases, concurrency, error handling. Build, check and run what can be run to confirm.
@@ -38,7 +39,7 @@ Launch one `audit-verifier` agent with every finding of severity high or medium.
 
 ## 5. Report
 
-Load the `artifact-design` skill, then publish the report as an Artifact, written in the language the user is using in the conversation. Sections, in this order:
+Load the `artifact-design` skill if it is available, then publish the report as an Artifact, written in the language the user is using in the conversation. Sections, in this order:
 
 1. **Summary**: overall state in a few lines and the counts per severity.
 2. **What is done well**: concrete, backed by files; not filler.
