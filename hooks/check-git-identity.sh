@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # PreToolUse hook (matcher: Bash). Blocks `git commit` if the effective identity
 # (author and committer) does not match the expected identity, which is resolved as follows:
-#   1. NODICLAUDE_GIT_NAME and NODICLAUDE_GIT_EMAIL, if both are set (cloud).
-#   2. otherwise, `git config --global user.name` and `user.email`, if both have a value (local).
-#   3. otherwise, warn and allow (exit 0). With only one of the two variables, it also warns and allows.
+#   1. NODICLAUDE_GIT_NAME and NODICLAUDE_GIT_EMAIL, if both are set.
+#   2. otherwise, ~/.claude/.nodiclaude-identity (line 1 = name, line 2 = email), written by
+#      install.sh when it was run with those variables (cloud).
+#   3. otherwise, `git config --global --includes user.name` and `user.email` evaluated for the
+#      target repo, so `includeIf` sections apply and repo-local config does not (local).
+#   4. otherwise, warn and allow (exit 0). With only one of the two variables, it also warns and allows.
 #
 # It is a "best effort" safeguard: it does not detect aliases (e.g. `git ci`), dynamically
 # built commands (variables, eval, scripts) or commits made outside the Bash tool.
@@ -28,6 +31,7 @@ command_str="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/de
 # the subcommand: `-x`/`--long` with an optional value (quoted or unquoted).
 sq="'"
 bq='`'
+nl=$'\n'
 pre="(^|[/\"${sq}${bq}{;&|(]|[[:space:]])"
 # Value: a mix of quoted segments, \-escaped characters and plain text.
 optval="(\"[^\"]*\"|${sq}[^${sq}]*${sq}|\\\\.|[^-[:space:];&|\"${sq}${bq})\\\\])(\"[^\"]*\"|${sq}[^${sq}]*${sq}|\\\\.|[^[:space:];&|\"${sq}${bq})\\\\])*"
@@ -74,6 +78,8 @@ tokenize() {
 resolve_dir() {
   local base="$1" d="$2"
   d="$(printf '%s' "$d" | sed 's/\\\(.\)/\1/g')"
+  # The literal "~" typed in the command is matched on purpose.
+  # shellcheck disable=SC2088
   case "$d" in
     "~") d="$HOME" ;;
     "~/"*) d="$HOME/${d#"~/"}" ;;
@@ -91,10 +97,10 @@ cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)" || cwd=""
 [ -n "$cwd" ] || cwd="."
 repo="$cwd"
 
-# `cd <dir> &&` / `cd <dir> ;` before git (the last one is used).
-cd_re="^(.*[;&|(${bq}[:space:]])?cd[[:space:]]+(\"[^\"]*\"|${sq}[^${sq}]*${sq}|(\\\\.|[^[:space:];&|\\\\])+)[[:space:]]*(&&|;)"
+# `cd <dir>` / `pushd <dir>` followed by `&&`, `||`, `;` or a newline before git (the last one is used).
+cd_re="^(.*[;&|(${bq}{\"${sq}[:space:]])?(cd|pushd)[[:space:]]+(\"[^\"]*\"|${sq}[^${sq}]*${sq}|(\\\\.|[^[:space:];&|\\\\])+)[[:space:]]*(&&|\\|\\||;|${nl})"
 if [[ $before =~ $cd_re ]]; then
-  tokenize "cd ${BASH_REMATCH[2]}"
+  tokenize "cd ${BASH_REMATCH[3]}"
   if [ "${#TOK[@]}" -ge 2 ]; then repo="$(resolve_dir "$repo" "${TOK[1]}")"; fi
 fi
 
@@ -125,7 +131,7 @@ fi
 
 # Inline environment variables right before git (GIT_AUTHOR_NAME=x git commit).
 env_args=()
-seg="${before##*[;&|(\`{]}"
+seg="${before##*[;&|(\`{${nl}]}"
 tokenize "$seg"
 for t in ${TOK[@]+"${TOK[@]}"}; do
   case "$t" in
@@ -151,6 +157,19 @@ while [ "$i" -lt "${#TOK[@]}" ]; do
   esac
   i=$((i + 1))
 done
+
+# --- Expected identity ----------------------------------------------------------
+# Sources 1 and 2 were resolved once (see the header); source 3 depends on the repo.
+EXP_NAME="$FIXED_NAME"
+EXP_EMAIL="$FIXED_EMAIL"
+if [ -z "$EXP_NAME" ]; then
+  EXP_NAME="$(git -C "$repo" config --global --includes user.name 2>/dev/null)" || EXP_NAME=""
+  EXP_EMAIL="$(git -C "$repo" config --global --includes user.email 2>/dev/null)" || EXP_EMAIL=""
+  if [ -z "$EXP_NAME" ] || [ -z "$EXP_EMAIL" ]; then
+    warn "no identity source (neither NODICLAUDE_GIT_NAME/EMAIL, ~/.claude/.nodiclaude-identity nor git config --global user.name/user.email); identity not verified."
+    return 0
+  fi
+fi
 
 # --- Effective identity -------------------------------------------------------
 # If git var fails (no identity configured) it is treated as empty.
@@ -205,20 +224,20 @@ clean() { printf '%s' "$1" | LC_ALL=C tr -cd '[:print:]' | cut -c1-100; }
 
 command -v git >/dev/null 2>&1 || { warn "git not available; identity not verified."; exit 0; }
 
-# Expected identity (see header).
-EXP_NAME=""
-EXP_EMAIL=""
+# Expected identity, sources 1 and 2 (see header). Empty means: resolve per repo (source 3).
+FIXED_NAME=""
+FIXED_EMAIL=""
 if [ -n "${NODICLAUDE_GIT_NAME:-}" ] && [ -n "${NODICLAUDE_GIT_EMAIL:-}" ]; then
-  EXP_NAME="$NODICLAUDE_GIT_NAME"
-  EXP_EMAIL="$NODICLAUDE_GIT_EMAIL"
+  FIXED_NAME="$NODICLAUDE_GIT_NAME"
+  FIXED_EMAIL="$NODICLAUDE_GIT_EMAIL"
 elif [ -n "${NODICLAUDE_GIT_NAME:-}" ] || [ -n "${NODICLAUDE_GIT_EMAIL:-}" ]; then
   warn "only one of NODICLAUDE_GIT_NAME / NODICLAUDE_GIT_EMAIL is set (both are required); identity not verified."
   exit 0
-else
-  EXP_NAME="$(git config --global user.name 2>/dev/null)" || EXP_NAME=""
-  EXP_EMAIL="$(git config --global user.email 2>/dev/null)" || EXP_EMAIL=""
-  if [ -z "$EXP_NAME" ] || [ -z "$EXP_EMAIL" ]; then
-    warn "no identity source (neither NODICLAUDE_GIT_NAME/EMAIL nor git config --global user.name/user.email); identity not verified."
+elif [ -f "$HOME/.claude/.nodiclaude-identity" ]; then
+  FIXED_NAME="$(sed -n 1p "$HOME/.claude/.nodiclaude-identity" 2>/dev/null | tr -d '\r')"
+  FIXED_EMAIL="$(sed -n 2p "$HOME/.claude/.nodiclaude-identity" 2>/dev/null | tr -d '\r')"
+  if [ -z "$FIXED_NAME" ] || [ -z "$FIXED_EMAIL" ]; then
+    warn "$HOME/.claude/.nodiclaude-identity is incomplete; identity not verified (run install.sh again)."
     exit 0
   fi
 fi
@@ -229,6 +248,7 @@ consumed=""
 status=0
 while [[ $rest =~ $commit_re ]]; do
   m="${BASH_REMATCH[0]}"
+  p="${BASH_REMATCH[1]}" # the prefix character (separator, quote...) belongs to `before`
   # Text before and after the detected fragment.
   case "$m" in
     *commit)
@@ -242,7 +262,8 @@ while [[ $rest =~ $commit_re ]]; do
       m="${m%?}"
       ;;
   esac
-  before="${consumed}${before}"
+  before="${consumed}${before}${p}"
+  m="${m#"$p"}"
   check_one || status=2
   consumed="${before}${m}"
   rest="$after"

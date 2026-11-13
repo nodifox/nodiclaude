@@ -1,12 +1,37 @@
 #!/usr/bin/env bash
 # Installs nodiclaude's skills, agents, hooks and rules into $HOME/.claude.
 # Safe to run repeatedly: it does not duplicate entries and does not rewrite what has not changed.
+#
+# Usage:
+#   install.sh              install or update (local)
+#   install.sh --cloud      install in a cloud environment (from its setup script; see README)
+#   install.sh --uninstall  remove what nodiclaude installed
 set -euo pipefail
+
+MODE="install"
+CLOUD=0
+for arg in "$@"; do
+  case "$arg" in
+    --cloud) CLOUD=1 ;;
+    --uninstall) MODE="uninstall" ;;
+    *)
+      echo "[nodiclaude] ERROR: unknown option '$arg' (valid options: --cloud, --uninstall)." >&2
+      exit 1
+      ;;
+  esac
+done
+if [ "$MODE" = "uninstall" ] && [ "$CLOUD" -eq 1 ]; then
+  echo "[nodiclaude] ERROR: --cloud and --uninstall cannot be combined." >&2
+  exit 1
+fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
 MANIFEST="$CLAUDE_DIR/.nodiclaude-manifest"
+VERSION_FILE="$CLAUDE_DIR/.nodiclaude-version"
+CACHE_FILE="$CLAUDE_DIR/.nodiclaude-update-cache"
+IDENTITY_FILE="$CLAUDE_DIR/.nodiclaude-identity"
 BACKUP_DIR="$CLAUDE_DIR/.nodiclaude-backup/$(date +%Y%m%d-%H%M%S)"
 
 tmp=""
@@ -15,11 +40,158 @@ trap 'rm -f "${tmp:-}" "${newlist:-}"' EXIT
 
 log() { echo "[nodiclaude] $*"; }
 
+# --- Helpers ------------------------------------------------------------------------
+try_run() {
+  local out
+  out="$("$@" 2>&1)" || { log "WARNING: '$*' failed: $(printf '%s\n' "$out" | tail -n 1)"; return 1; }
+}
+
+# Uses the existing jq or tries to install it.
+ensure_jq() {
+  command -v jq >/dev/null 2>&1 && return 0
+  log "jq not found; trying to install it..."
+  local sudo=()
+  if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then sudo=(sudo -n); fi
+  if command -v apt-get >/dev/null 2>&1; then
+    try_run ${sudo[@]+"${sudo[@]}"} apt-get install -y jq ||
+      { try_run ${sudo[@]+"${sudo[@]}"} apt-get update && try_run ${sudo[@]+"${sudo[@]}"} apt-get install -y jq; } || true
+  elif command -v brew >/dev/null 2>&1; then
+    try_run brew install jq || true
+  elif command -v apk >/dev/null 2>&1; then
+    try_run ${sudo[@]+"${sudo[@]}"} apk add jq || true
+  fi
+  command -v jq >/dev/null 2>&1
+}
+
+# backup <rel>: copies $CLAUDE_DIR/<rel> to the backup directory of this run.
+backup() {
+  mkdir -p "$BACKUP_DIR/$(dirname "$1")"
+  cp -p "$CLAUDE_DIR/$1" "$BACKUP_DIR/$1"
+  log "backup: $CLAUDE_DIR/$1 -> $BACKUP_DIR/$1"
+}
+
+# inside_claude <existing dir>: true if it resolves (following symlinks) inside $CLAUDE_DIR.
+inside_claude() {
+  local d
+  d="$(cd -P "$1" 2>/dev/null && pwd)" || return 1
+  case "$d/" in "$REAL_CLAUDE/"*) return 0 ;; esac
+  return 1
+}
+
+# Applies a jq filter to settings.json without aborting on failure. Usage: jq_apply <description> <jq args...>
+# settings.json is backed up once per run before its first change. The result is written
+# with `cat >` to preserve symlinks and permissions.
+settings_backed_up=0
+jq_apply() {
+  local what="$1"
+  shift
+  tmp="$(mktemp "$CLAUDE_DIR/.nodiclaude-settings.XXXXXX")"
+  if jq "$@" > "$tmp" 2>/dev/null; then
+    # Only written if the content changes (semantic comparison): avoids reformatting.
+    if [ "$(jq -S . "$tmp")" != "$(jq -S . "$SETTINGS")" ]; then
+      if [ "$settings_backed_up" -eq 0 ]; then
+        backup settings.json
+        settings_backed_up=1
+      fi
+      cat "$tmp" > "$SETTINGS"
+      log "settings.json: $what"
+    fi
+  else
+    log "WARNING: could not update settings.json ($what): invalid JSON or unexpected structure; leaving it untouched."
+  fi
+  rm -f "$tmp"
+  tmp=""
+}
+
+# remove_hook_entries <script name>: removes the hooks whose command runs
+# $HOME/.claude/hooks/<script name>, then groups and events left empty.
+remove_hook_entries() {
+  jq_apply "removed hook $1" --arg cmd '$HOME/.claude/hooks/'"$1" '
+    if (.hooks | type) == "object" then
+      .hooks |= (with_entries(
+          if (.value | type) == "array" then
+            .value |= ([ .[] | .hooks |= (if type == "array" then map(select(((.command // "") | split(" ")[0]) != $cmd)) else . end) ]
+                       | map(select((.hooks | type) != "array" or (.hooks | length) > 0)))
+          else . end)
+        | with_entries(select(.value != [])))
+    else . end' "$SETTINGS"
+}
+
+# remove_installed <rel>: removes a file nodiclaude installed. Edited files are backed up
+# first. Appends hook names to removed_hooks.
+removed_hooks=()
+remove_installed() {
+  local rel="$1" dst d
+  case "$rel" in
+    *..* | /*) return 0 ;;
+    skills/* | agents/* | hooks/* | rules/*) ;;
+    *) return 0 ;;
+  esac
+  dst="$CLAUDE_DIR/$rel"
+  if [ -L "$dst" ]; then
+    log "WARNING: $dst is a symlink; not removing."
+    return 0
+  fi
+  # Regular files only; directories are left alone.
+  if [ -d "$dst" ]; then return 0; fi
+  case "$rel" in hooks/*) removed_hooks[${#removed_hooks[@]}]="${rel#hooks/}" ;; esac
+  [ -f "$dst" ] || return 0
+  if ! inside_claude "$(dirname "$dst")"; then
+    log "WARNING: $dst is in a symlinked directory outside $CLAUDE_DIR; not removing."
+    return 0
+  fi
+  if ! { [ -f "$REPO_DIR/$rel" ] && cmp -s "$REPO_DIR/$rel" "$dst"; }; then backup "$rel"; fi
+  if rm -f "$dst"; then
+    log "removed: $dst"
+  else
+    log "WARNING: could not remove $dst"
+  fi
+  # Prune empty directories under skills/.
+  case "$rel" in
+    skills/*)
+      d="$(dirname "$dst")"
+      while [ "$d" != "$CLAUDE_DIR/skills" ] && [ "$d" != "$CLAUDE_DIR" ] && rmdir "$d" 2>/dev/null; do
+        d="$(dirname "$d")"
+      done
+      ;;
+  esac
+}
+
+# --- Uninstall ----------------------------------------------------------------------
+if [ "$MODE" = "uninstall" ]; then
+  if [ ! -d "$CLAUDE_DIR" ]; then
+    log "nothing to uninstall ($CLAUDE_DIR does not exist)"
+    exit 0
+  fi
+  REAL_CLAUDE="$(cd -P "$CLAUDE_DIR" && pwd)"
+  if [ -f "$MANIFEST" ]; then
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      remove_installed "$rel"
+    done < "$MANIFEST"
+  else
+    log "note: no manifest; no installed files to remove"
+  fi
+  if [ ${#removed_hooks[@]} -gt 0 ] && [ -s "$SETTINGS" ]; then
+    if ensure_jq; then
+      for h in "${removed_hooks[@]}"; do remove_hook_entries "$h"; done
+    else
+      log "WARNING: no jq; remove the nodiclaude hook entries from $SETTINGS by hand."
+    fi
+  fi
+  rm -f "$MANIFEST" "$VERSION_FILE" "$CACHE_FILE" "$IDENTITY_FILE"
+  log "state files removed"
+  log "left in place: the other keys of settings.json (including attribution), git config --global and backups in $CLAUDE_DIR/.nodiclaude-backup"
+  log "uninstall complete; start a new Claude Code session"
+  exit 0
+fi
+
 # --- Commit identity ----------------------------------------------------------------
 # Resolved BEFORE touching anything. Order:
 #   1. NODICLAUDE_GIT_NAME and NODICLAUDE_GIT_EMAIL, if both are set (cloud).
-#   2. git config --global user.name and user.email, if both have a value (local).
+#   2. git config --global user.name and user.email (includes followed), if both have a value (local).
 #   3. Otherwise, error and exit without changing anything.
+# With --cloud only source 1 is accepted.
 ID_SRC=""
 ID_NAME=""
 ID_EMAIL=""
@@ -31,9 +203,13 @@ elif [ -n "${NODICLAUDE_GIT_NAME:-}" ] || [ -n "${NODICLAUDE_GIT_EMAIL:-}" ]; th
   echo "[nodiclaude] ERROR: only one of NODICLAUDE_GIT_NAME / NODICLAUDE_GIT_EMAIL is set." >&2
   echo "             Set both or neither. Nothing has been changed." >&2
   exit 1
+elif [ "$CLOUD" -eq 1 ]; then
+  echo "[nodiclaude] ERROR: --cloud needs your commit identity: NODICLAUDE_GIT_NAME and NODICLAUDE_GIT_EMAIL are empty." >&2
+  echo "             Fill in both in the environment's setup script. Nothing has been changed." >&2
+  exit 1
 else
-  g_name="$(git config --global user.name 2>/dev/null || true)"
-  g_email="$(git config --global user.email 2>/dev/null || true)"
+  g_name="$(git -C / config --global --includes user.name 2>/dev/null || true)"
+  g_email="$(git -C / config --global --includes user.email 2>/dev/null || true)"
   if [ -n "$g_name" ] && [ -n "$g_email" ]; then
     ID_SRC="global"
     ID_NAME="$g_name"
@@ -69,48 +245,7 @@ else
 fi
 
 mkdir -p "$CLAUDE_DIR/skills" "$CLAUDE_DIR/agents" "$CLAUDE_DIR/hooks" "$CLAUDE_DIR/rules"
-
-# --- jq ----------------------------------------------------------------------
-# Use the existing one or try to install it.
-try_run() {
-  local out
-  out="$("$@" 2>&1)" || { log "WARNING: '$*' failed: $(printf '%s\n' "$out" | tail -n 1)"; return 1; }
-}
-
-ensure_jq() {
-  command -v jq >/dev/null 2>&1 && return 0
-  log "jq not found; trying to install it..."
-  local sudo=()
-  if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then sudo=(sudo -n); fi
-  if command -v apt-get >/dev/null 2>&1; then
-    try_run ${sudo[@]+"${sudo[@]}"} apt-get install -y jq ||
-      { try_run ${sudo[@]+"${sudo[@]}"} apt-get update && try_run ${sudo[@]+"${sudo[@]}"} apt-get install -y jq; } || true
-  elif command -v brew >/dev/null 2>&1; then
-    try_run brew install jq || true
-  elif command -v apk >/dev/null 2>&1; then
-    try_run ${sudo[@]+"${sudo[@]}"} apk add jq || true
-  fi
-  command -v jq >/dev/null 2>&1
-}
-
-# Applies a jq filter to settings.json without aborting on failure. Usage: jq_apply <description> <jq args...>
-# The result is written with `cat >` to preserve symlinks and permissions.
-jq_apply() {
-  local what="$1"
-  shift
-  tmp="$(mktemp "$CLAUDE_DIR/.nodiclaude-settings.XXXXXX")"
-  if jq "$@" > "$tmp" 2>/dev/null; then
-    # Only written if the content changes (semantic comparison): avoids reformatting.
-    if [ "$(jq -S . "$tmp")" != "$(jq -S . "$SETTINGS")" ]; then
-      cat "$tmp" > "$SETTINGS"
-      log "settings.json: $what"
-    fi
-  else
-    log "WARNING: could not update settings.json ($what): invalid JSON or unexpected structure; leaving it untouched."
-  fi
-  rm -f "$tmp"
-  tmp=""
-}
+REAL_CLAUDE="$(cd -P "$CLAUDE_DIR" && pwd)"
 
 # --- Repo files ---------------------------------------------------------------------
 newlist="$(mktemp "$CLAUDE_DIR/.nodiclaude-list.XXXXXX")"
@@ -129,12 +264,17 @@ while IFS= read -r rel; do
     log "WARNING: $dst is a symlink; skipping."
     continue
   fi
+  # The nearest existing directory must be inside $CLAUDE_DIR (not a symlink to elsewhere).
+  p="$(dirname "$dst")"
+  while [ ! -e "$p" ]; do p="$(dirname "$p")"; done
+  if ! inside_claude "$p"; then
+    log "WARNING: $p is a symlink to a directory outside $CLAUDE_DIR; skipping $rel."
+    continue
+  fi
   mkdir -p "$(dirname "$dst")"
   if [ -e "$dst" ]; then
     if ! cmp -s "$src" "$dst"; then
-      mkdir -p "$BACKUP_DIR/$(dirname "$rel")"
-      cp -p "$dst" "$BACKUP_DIR/$rel"
-      log "backup: $dst -> $BACKUP_DIR/$rel"
+      backup "$rel"
       cp -f "$src" "$dst"
       log "replaced: $dst"
       copied=$((copied + 1))
@@ -149,81 +289,94 @@ done < "$newlist"
 log "skills, agents, hooks and rules up to date in $CLAUDE_DIR ($copied files copied)"
 
 # --- Files removed from the repo ----------------------------------------------------
-removed_hooks=()
 if [ -f "$MANIFEST" ]; then
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
-    case "$rel" in
-      *..* | /*) continue ;;
-      skills/* | agents/* | hooks/* | rules/*) ;;
-      *) continue ;;
-    esac
     printf '%s' "$newmanifest" | grep -Fxq -- "$rel" && continue
-    dst="$CLAUDE_DIR/$rel"
-    if [ -L "$dst" ]; then
-      log "WARNING: $dst is a symlink; not removing."
-      continue
-    fi
-    # Regular files only; directories are left alone.
-    if [ -d "$dst" ]; then continue; fi
-    if [ -f "$dst" ]; then
-      if rm -f "$dst"; then
-        log "removed (no longer in the repo): $dst"
-      else
-        log "WARNING: could not remove $dst"
-      fi
-    fi
-    case "$rel" in hooks/*) removed_hooks[${#removed_hooks[@]}]="${rel#hooks/}" ;; esac
-    # Prune empty directories under skills/.
-    case "$rel" in
-      skills/*)
-        d="$(dirname "$dst")"
-        while [ "$d" != "$CLAUDE_DIR/skills" ] && [ "$d" != "$CLAUDE_DIR" ] && rmdir "$d" 2>/dev/null; do
-          d="$(dirname "$d")"
-        done
-        ;;
-    esac
+    remove_installed "$rel"
   done < "$MANIFEST"
 fi
 printf '%s' "$newmanifest" > "$MANIFEST"
 
 # --- settings.json ------------------------------------------------------------------
-if [ ! -s "$SETTINGS" ]; then
+have_jq=0
+ensure_jq && have_jq=1
+if [ ! -s "$SETTINGS" ] || ! grep -q '[^[:space:]]' "$SETTINGS"; then
   cat "$REPO_DIR/settings.json" > "$SETTINGS"
   log "settings.json created"
-elif ensure_jq; then
+elif [ "$have_jq" -eq 1 ]; then
   for h in ${removed_hooks[@]+"${removed_hooks[@]}"}; do
-    jq_apply "removed hook $h" --arg name "$h" '
-      if (.hooks | type) == "object" then
-        .hooks |= with_entries(
-          if (.value | type) == "array" then
-            .value |= ([ .[] | .hooks |= (if type == "array" then map(select((.command // "" | split(" ")[0] | endswith("/hooks/" + $name)) | not)) else . end) ]
-                       | map(select((.hooks | type) != "array" or (.hooks | length) > 0)))
-          else . end)
-      else . end' "$SETTINGS"
+    remove_hook_entries "$h"
   done
-  # Hook entries are replaced by command (a matcher change is applied without
-  # duplicating); for all other keys the existing value wins.
+  # Hooks are matched by script path (the command's first word): in each event, the
+  # existing hooks that run one of the repo's scripts are removed (groups left empty are
+  # dropped) and the repo's groups are appended. A matcher or argument change is applied
+  # without duplicating, and the user's other hooks are kept. For all other keys the
+  # existing value wins.
   jq_apply "merged" -s '
     .[0] as $new | .[1] as $old
     | (($new | del(.hooks)) * $old) as $base
     | reduce (($new.hooks // {}) | to_entries[]) as $ev ($base;
-        ($ev.value | [ .[] | .hooks[]? | .command ]) as $cmds
+        ($ev.value | [ .[] | .hooks[]? | .command | split(" ")[0] ]) as $scripts
         | .hooks[$ev.key] = (
             [ (.hooks[$ev.key] // [])[]
-              | select(([ .hooks[]? | .command ] | any(. as $c | $cmds | index($c))) | not) ]
+              | .hooks |= (if type == "array" then map(select(((.command // "") | split(" ")[0]) as $s | ($scripts | index($s)) | not)) else . end)
+              | select((.hooks | type) != "array" or (.hooks | length) > 0) ]
             + $ev.value))
   ' "$REPO_DIR/settings.json" "$SETTINGS"
 else
   log "WARNING: no jq; existing settings.json left unmodified (merge it by hand)."
 fi
+if [ "$have_jq" -eq 0 ]; then
+  log "WARNING: jq is not installed: the check-git-identity hook cannot verify commits until it is. Install jq."
+fi
 
-# --- Global git identity ------------------------------------------------------------
+# --- Commit identity ----------------------------------------------------------------
+# write_identity_file: state read by hooks/check-git-identity.sh (line 1 = name, line 2 = email).
+write_identity_file() {
+  local itmp
+  itmp="$(mktemp "$CLAUDE_DIR/.nodiclaude-identity.XXXXXX")"
+  printf '%s\n%s\n' "$ID_NAME" "$ID_EMAIL" > "$itmp"
+  mv -f "$itmp" "$IDENTITY_FILE"
+  log "identity file written ($IDENTITY_FILE)"
+}
+
 if [ "$ID_SRC" = "global" ]; then
-  # Local: never writes to any gitconfig.
+  # Local: never writes to any gitconfig. The hook resolves the identity from git config.
   log "commit identity (git config --global): '$ID_NAME' <$ID_EMAIL>"
+  if [ -f "$IDENTITY_FILE" ]; then
+    rm -f "$IDENTITY_FILE"
+    log "identity file removed (the identity now comes from git config)"
+  fi
+elif [ "$CLOUD" -eq 1 ]; then
+  # Cloud: the identity from the setup script replaces the one the image ships, and commit
+  # signing is turned off because the platform's signing key does not belong to that identity.
+  log "commit identity (NODICLAUDE_GIT_*, --cloud): '$ID_NAME' <$ID_EMAIL>"
+  for key in name email; do
+    if [ "$key" = "name" ]; then want="$ID_NAME"; else want="$ID_EMAIL"; fi
+    cur="$(git config --global "user.$key" 2>/dev/null || true)"
+    if [ "$cur" != "$want" ]; then
+      if git config --global "user.$key" "$want"; then
+        if [ -n "$cur" ]; then
+          log "git config --global user.$key written: '$want' (was '$cur')"
+        else
+          log "git config --global user.$key written: '$want'"
+        fi
+      else
+        log "WARNING: could not write git config --global user.$key"
+      fi
+    fi
+  done
+  if [ "$(git config --global commit.gpgsign 2>/dev/null || true)" != "false" ]; then
+    if git config --global commit.gpgsign false; then
+      log "git config --global commit.gpgsign written: 'false' (the platform's signing key is not yours)"
+    else
+      log "WARNING: could not write git config --global commit.gpgsign"
+    fi
+  fi
+  write_identity_file
 else
-  # Cloud: only the missing keys are written; an existing one is never overwritten.
+  # Variables outside the cloud: only the missing keys are written; an existing one is never overwritten.
   log "commit identity (NODICLAUDE_GIT_*): '$ID_NAME' <$ID_EMAIL>"
   for key in name email; do
     if [ "$key" = "name" ]; then want="$ID_NAME"; var="NODICLAUDE_GIT_NAME"; else want="$ID_EMAIL"; var="NODICLAUDE_GIT_EMAIL"; fi
@@ -235,20 +388,21 @@ else
         log "WARNING: could not write git config --global user.$key"
       fi
     elif [ "$cur" != "$want" ]; then
-      log "WARNING: git config --global user.$key is '$cur' and ${var} requires '$want'; not overwriting. The hook will block commits until they match."
+      log "WARNING: git config --global user.$key is '$cur' and ${var} requires '$want'; not overwriting. The hook expects '$want' and will block commits until they match."
     fi
   done
+  write_identity_file
 fi
 
 # --- Version file ---------------------------------------------------------------------
 # State (not a repo file, not in the manifest) read by hooks/check-update.sh:
-# line 1 = installed commit, line 2 = URL of origin (credentials stripped).
+# line 1 = installed commit, line 2 = URL of origin (credentials stripped from http(s) URLs).
 if [ -e "$REPO_DIR/.git" ] && head_hash="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" && [ -n "$head_hash" ]; then
   origin_url="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
-  origin_url="$(printf '%s' "$origin_url" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@#\1#')"
+  origin_url="$(printf '%s' "$origin_url" | sed -E 's#^([Hh][Tt][Tt][Pp][Ss]?://)[^/]*@#\1#')"
   vtmp="$(mktemp "$CLAUDE_DIR/.nodiclaude-version.XXXXXX")"
   printf '%s\n%s\n' "$head_hash" "$origin_url" > "$vtmp"
-  mv -f "$vtmp" "$CLAUDE_DIR/.nodiclaude-version"
+  mv -f "$vtmp" "$VERSION_FILE"
   log "version file written (${head_hash:0:7})"
 else
   log "note: $REPO_DIR is not a git repo with a commit; version file not written (update checks disabled)"

@@ -51,7 +51,8 @@ lookup() {
   command -v git >/dev/null 2>&1 || return 0
   out="$(mktemp "${TMPDIR:-/tmp}/nodiclaude-lookup.XXXXXX" 2>/dev/null)" || return 0
   # BatchMode: ssh must not prompt on /dev/tty; a user-set GIT_SSH_COMMAND is kept.
-  GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}" GIT_TERMINAL_PROMPT=0 git ls-remote -- "$1" refs/heads/main > "$out" 2>/dev/null < /dev/null &
+  # Run from / so the session folder's .git/config (which can run commands) is not read.
+  (cd / && GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}" GIT_TERMINAL_PROMPT=0 exec git ls-remote -- "$1" refs/heads/main) > "$out" 2>/dev/null < /dev/null &
   pid=$!
   i=0
   while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$LOOKUP_TICKS" ]; do
@@ -77,7 +78,7 @@ lookup() {
 notice() { # notice <installed> <remote>
   local a="${1:0:7}" b="${2:0:7}"
   printf 'nodiclaude is outdated (installed %s, latest %s).\n' "$a" "$b"
-  printf 'Local: git pull && ./install.sh\n'
+  printf 'Local: git switch main && git pull && ./install.sh\n'
   printf 'Cloud: in the environment setup script change "# rev: ..." to "# rev: %s" and start a new session.\n' "$b"
 }
 
