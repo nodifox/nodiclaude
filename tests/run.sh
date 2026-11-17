@@ -190,7 +190,9 @@ check "hook: global, repo inherits the global identity => 0" 0 "$RC"
 mkdir -p "$T/work"
 mkrepo "$T/work/r" "$GOOD_NAME" "work@example.com"
 mkrepo "$T/work/personal" "$GOOD_NAME" "$GOOD_EMAIL"
-printf '[includeIf "gitdir:%s/work/"]\n\tpath = %s/work.inc\n' "$T" "$T" >> "$GIT_CONFIG_GLOBAL"
+# git matches gitdir: against the repo's real path (on macOS mktemp -d is under the /var symlink).
+TREAL="$(cd -P "$T" && pwd)"
+printf '[includeIf "gitdir:%s/work/"]\n\tpath = %s/work.inc\n' "$TREAL" "$T" >> "$GIT_CONFIG_GLOBAL"
 printf '[user]\n\temail = work@example.com\n' > "$T/work.inc"
 run_hook_raw "$T/work/r" "git commit -m x" A=1
 check "hook: includeIf, work identity in work repo => 0" 0 "$RC"
