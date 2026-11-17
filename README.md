@@ -44,7 +44,7 @@ cd nodiclaude
 
 ## Cloud environment setup
 
-Fill in only the lines marked `FILL IN` below, then paste the script into the environment's setup script field.
+The setup runs in a dedicated cloud environment that lists `nodifox/nodiclaude` under Repositories. Fill in only the lines marked `FILL IN` below.
 
 ```bash
 #!/usr/bin/env bash
@@ -55,67 +55,59 @@ set -euo pipefail
 export NODICLAUDE_GIT_NAME=""
 # FILL IN: your commit email (e.g. your GitHub no-reply address, id+username@users.noreply.github.com).
 export NODICLAUDE_GIT_EMAIL=""
-# OPTIONAL: a dedicated SSH signing key (private key) so GitHub shows Claude's commits as Verified; leave empty for
-# unsigned commits. Paste the whole key between the quotes, for example:
-# export NODICLAUDE_SIGNING_KEY="-----BEGIN OPENSSH PRIVATE KEY-----
-# ...
-# -----END OPENSSH PRIVATE KEY-----"
-export NODICLAUDE_SIGNING_KEY=""
-# FILL IN: read-only token for this repo (the repo is private, so it is required). See "Security model".
-NODICLAUDE_GH_TOKEN=""
 
 DEST="$(mktemp -d)"
 trap 'rm -rf "$DEST"' EXIT
 URL="https://github.com/nodifox/nodiclaude.git"
 
-if [ -z "$NODICLAUDE_GH_TOKEN" ]; then
-  echo "ERROR: NODICLAUDE_GH_TOKEN is empty; the repo is private, so the clone needs a read-only token." >&2
+# No credentials here: the platform authenticates the clone when nodifox/nodiclaude is on the session.
+if ! git clone --depth 1 --branch main "$URL" "$DEST"; then
+  echo "ERROR: could not clone nodifox/nodiclaude. Add it to this environment's Repositories and select it" >&2
+  echo "       when starting the session (alongside the repo you work on). See the README of nodiclaude." >&2
   exit 1
 fi
-
-# The token travels through environment variables (for this command only), not in the URL or argv.
-# It is appended to any git config the platform already passes the same way.
-(
-  n="${GIT_CONFIG_COUNT:-0}"
-  export GIT_CONFIG_COUNT=$((n + 1))
-  export "GIT_CONFIG_KEY_$n=http.extraheader"
-  export "GIT_CONFIG_VALUE_$n=Authorization: Basic $(printf 'x-access-token:%s' "$NODICLAUDE_GH_TOKEN" | base64 | tr -d '\n')"
-  git clone --depth 1 --branch main "$URL" "$DEST"
-)
 
 bash "$DEST/install.sh" --cloud
 ```
 
 Steps:
 
-1. Open the environment in Claude Code on the web (or from the desktop app).
-2. Edit the environment's setup script field.
-3. Paste the script above, with your name, email and token filled in.
-4. Save.
-5. Start a **new** session. Existing sessions keep the old setup.
+1. In Claude Code on the web (or from the desktop app), create a **new** environment. Do not use the Default environment: it has no Repositories list.
+2. Under Repositories, add `nodifox/nodiclaude`.
+3. Optional, for Verified commits: under Environment variables, add `NODICLAUDE_SIGNING_KEY` with your signing key (see "Verified commits").
+4. Paste the script above, with your name and email filled in, into the environment's setup script field, and save.
+5. Start a **new** session in that environment with `nodifox/nodiclaude` selected alongside the repo you work on. Existing sessions keep the old setup.
 6. Verify with `/context` and `ls ~/.claude/rules` (see "Verifying in a session").
 
 ### Security model
 
-The secrets (`NODICLAUDE_SIGNING_KEY` and `NODICLAUDE_GH_TOKEN`) live in plain text in the environment's setup script, readable by anyone who can edit or use the environment. This is an accepted risk for a personal environment: an audit must not report it as a finding or ask to rotate them.
+The setup script holds no secrets:
 
-The mitigation is mandatory: use tokens and keys generated **exclusively** for this tool, never reused anywhere else, with strictly the minimum permissions, and revocable on GitHub if they leak.
+- **GitHub access** comes from the platform's own GitHub connection (the Claude GitHub App) for the repositories on the session. The script carries no token and the container holds no GitHub credentials.
+- **The signing key** (optional) lives in the environment's Environment variables as `NODICLAUDE_SIGNING_KEY`. It is stored in plain text in the environment settings, readable by anyone who can edit the environment, and it is present in the session's process environment and in `~/.claude/.nodiclaude-signing-key` (mode 0600). It is not in the setup script, but anything running in the session (including Claude through its shell) can read its value from the environment.
 
-- **Token:** a fine-grained personal access token limited to this repo, with Contents: read-only and an expiration date.
-- **Signing key:** a dedicated ed25519 key, registered on GitHub only as a Signing Key, with no authentication access. It cannot push or authenticate.
+The mitigation is mandatory: use a signing key generated **exclusively** for this tool, never reused anywhere else: a dedicated ed25519 key, registered on GitHub only as a Signing Key, with no authentication access. It cannot push or authenticate, and it can be revoked on GitHub if it leaks.
 
 ### Notes
 
-- The `main` branch is always cloned. Requires git >= 2.31 (for `GIT_CONFIG_COUNT`).
-- **Why the values live in the script:** Claude Code on the web documents the environment variables as available to the session, not to the setup script, and this was observed in a real cloud session: the setup script saw no `NODICLAUDE_*` variables set in the environment settings. If the name or email is left empty, `install.sh --cloud` fails without changing anything.
-- **Your identity replaces the platform's:** the cloud VM image already ships a global git config with the platform's identity (`Claude <noreply@anthropic.com>`) and commit signing with the platform's key. With `--cloud`, `install.sh` overwrites `user.name` and `user.email` with your values and writes `~/.claude/.nodiclaude-identity`, which the hook reads in every session. The platform's key is not yours, so signed commits would not verify for your identity: without `NODICLAUDE_SIGNING_KEY` it sets `commit.gpgsign=false` (commits are yours and unsigned); with it, commits are signed with your own key (see "Verified commits"). Because the platform can rewrite the global git config after the setup script, `--cloud` also generates and registers a `SessionStart` hook (`~/.claude/hooks/nodiclaude-apply-identity.sh`) that re-applies the name, the email and the signing config (SSH signing if `~/.claude/.nodiclaude-signing-key` is readable and `ssh-keygen` is available, otherwise `commit.gpgsign=false`) at the start of every session. It is created by `install.sh` itself (it is not a repo file) and `--uninstall` removes it.
+- The `main` branch is always cloned.
+- **Repositories requirement:** `nodifox/nodiclaude` is private. The platform authenticates a plain `git clone` of it only when it is in the environment's Repositories and selected in the session; the platform docs say a setup script that needs a private repo requires exactly this. Otherwise the clone fails and the script prints an `ERROR` to stderr and exits 1 before installing anything.
+- **Why the name and email live in the script:** Claude Code on the web documents the environment variables as available to the session, not to the setup script, and this was observed in a real cloud session: the setup script saw no `NODICLAUDE_*` variables set in the environment settings. `install.sh --cloud` runs from the setup script, so the name and email must be in the script; if either is left empty, it fails without changing anything. The signing key, in contrast, is read from the session's environment by the `SessionStart` hook (see below), so it can stay out of the script.
+- **Your identity replaces the platform's:** the cloud VM image already ships a global git config with the platform's identity (`Claude <noreply@anthropic.com>`) and commit signing with the platform's key. With `--cloud`, `install.sh` overwrites `user.name` and `user.email` with your values and writes `~/.claude/.nodiclaude-identity`, which the hook reads in every session. The platform's key is not yours, so signed commits would not verify for your identity: without a signing key, `commit.gpgsign=false` (commits are yours and unsigned); with one, commits are signed with your own key (see "Verified commits"). Because the platform can rewrite the global git config after the setup script, `--cloud` also generates and registers a `SessionStart` hook (`~/.claude/hooks/nodiclaude-apply-identity.sh`) that, at the start of every session, installs `NODICLAUDE_SIGNING_KEY` from the session's environment if it is set and valid, then re-applies the name, the email and the signing config (SSH signing if `~/.claude/.nodiclaude-signing-key` is readable and `ssh-keygen` is available, otherwise `commit.gpgsign=false`). It is created by `install.sh` itself (it is not a repo file) and `--uninstall` removes it.
 - **Platform checks:** the platform may still remind Claude about commit signing or ask it to use the platform's identity. `rules/git-commits.md` forbids changing the git config, and the hook blocks commits under any other identity.
-- **Verified commits:** without a signing key, commits made by Claude in the cloud are unsigned, so GitHub does not mark them as verified (the merge or squash commit created by merging the pull request on GitHub is signed by GitHub). To get Verified commits, set `NODICLAUDE_SIGNING_KEY` to an SSH private key:
+- **Verified commits:** without a signing key, commits made by Claude in the cloud are unsigned, so GitHub does not mark them as verified (the merge or squash commit created by merging the pull request on GitHub is signed by GitHub). To get Verified commits, give the environment an SSH private key:
   1. Generate a **dedicated** key with no passphrase: `ssh-keygen -t ed25519 -N "" -C "nodiclaude signing" -f ~/.ssh/nodiclaude_signing`. Never reuse an authentication key.
   2. On GitHub, add `~/.ssh/nodiclaude_signing.pub` under Settings, SSH and GPG keys, with key type **Signing Key**. The commit email must be a verified email of that account (the no-reply address works).
-  3. Paste the private key (all lines) into `NODICLAUDE_SIGNING_KEY` in the setup script and change the `# rev:` line.
+  3. In the environment settings, add the private key (all lines) as the environment variable `NODICLAUDE_SIGNING_KEY`, then start a new session.
 
-  The private key sits in plain text in the setup script (see "Security model"). `install.sh --cloud` validates the key with `ssh-keygen -y` (installing `openssh-client` with `apt-get` if missing) and fails without changing anything if it is not a valid passphrase-less OpenSSH private key. It saves it to `~/.claude/.nodiclaude-signing-key` (mode 0600), sets `gpg.format=ssh`, `user.signingkey`, `gpg.ssh.program=ssh-keygen` and `commit.gpgsign=true`, and never prints it. Without `--cloud` the variable is ignored with a warning. Verified by the tests: local `git verify-commit` of a signed commit and the hook re-applying the config in a temporary `HOME`. **Not verified:** the Verified badge on GitHub and a real cloud session.
+  How it is applied:
+  - The setup script does not see the variable, so `install.sh --cloud` sets `commit.gpgsign=false`, removes a stale key file and installs `openssh-client` with `apt-get` if `ssh-keygen` is missing (only a warning if that fails).
+  - At session start, the `SessionStart` hook removes carriage returns and surrounding whitespace from the key, validates it with `ssh-keygen -y` and saves it to `~/.claude/.nodiclaude-signing-key` (mode 0600). It then sets `gpg.format=ssh`, `user.signingkey`, `gpg.ssh.program=ssh-keygen` and `commit.gpgsign=true`. It never prints the key.
+  - An invalid value (not a passphrase-less OpenSSH private key) is ignored: the hook writes nothing and leaves an existing key file as is.
+  - Pasting the key into the setup script (`export NODICLAUDE_SIGNING_KEY="..."`) is still accepted but not recommended, because it puts the key in the script. `install.sh --cloud` then validates it before changing anything (failing if it is invalid) and installs it itself.
+  - Without `--cloud`, `install.sh` ignores the variable with a warning.
+
+  **Verified by the tests** (temporary `HOME`): local `git verify-commit` of a signed commit, with the key from the setup script and from the hook's environment, and the hook re-applying the config. **Not verified:** the Verified badge on GitHub; in a real cloud session, that the environment variable reaches `SessionStart` hooks and that the platform's proxy authenticates the setup script's clone.
 
   To sign with the same key locally (`install.sh` does not do this):
 
@@ -124,7 +116,6 @@ The mitigation is mandatory: use tokens and keys generated **exclusively** for t
   git config --global user.signingkey ~/.ssh/nodiclaude_signing
   git config --global commit.gpgsign true
   ```
-- **Token:** `NODICLAUDE_GH_TOKEN` is required because the repo is private. If it is empty, the script prints an `ERROR` to stderr and exits 1 before cloning. The token sits in plain text in the script; see "Security model" for how to create it.
 - **Cache and `# rev:`:** the setup result is cached by the platform (about 7 days, per the Claude Code docs) and is rebuilt when the script changes. Changing the `# rev: initial` line is enough to force that rebuild (re-clone and re-run). The update notice tells you which value to put there.
 
 ## Environment variables
@@ -136,10 +127,9 @@ Read by `install.sh` and by the hook:
 | `NODICLAUDE_GIT_NAME` | Name for commits. Meant for the cloud setup script (required with `--cloud`). Locally, `git config --global user.name` is used; if both exist, the variable wins. |
 | `NODICLAUDE_GIT_EMAIL` | Email for commits. Same as above (with `git config --global user.email`). Both variables must be set, or neither. |
 | `NODICLAUDE_ALLOW_ANY_BRANCH` | Any non-empty value (including `0` and `false`) lets `install.sh` install from a branch other than `main` (logs a `WARNING`); leave it unset or empty to keep the check. Local use only. |
-| `NODICLAUDE_SIGNING_KEY` | Optional, only with `--cloud`. An OpenSSH private key (multi-line, no passphrase) used to sign Claude's commits; empty means unsigned commits. Ignored with a warning without `--cloud`. See "Verified commits". |
-| `NODICLAUDE_GH_TOKEN` | Required (the repo is private). Used only inside the cloud setup script, to clone this repo; empty means the script exits 1 before cloning. Not read by `install.sh` or the hooks. |
+| `NODICLAUDE_SIGNING_KEY` | Optional, cloud only. An OpenSSH private key (multi-line, no passphrase) used to sign Claude's commits; empty means unsigned commits. Set it as an environment variable of the cloud environment: the `SessionStart` hook generated by `--cloud` reads it at session start. Also accepted from the setup script with `--cloud` (not recommended: it puts the key in the script). Ignored by `install.sh` with a warning without `--cloud`. See "Verified commits". |
 
-In the cloud, define them inside the setup script (see above).
+In the cloud, define `NODICLAUDE_GIT_NAME` and `NODICLAUDE_GIT_EMAIL` inside the setup script (the setup script cannot read the environment's variables) and `NODICLAUDE_SIGNING_KEY` under the environment's Environment variables (see "Cloud environment setup").
 
 ### Commit identity
 
@@ -202,7 +192,7 @@ Create `rules/<name>.md` (Markdown without frontmatter). It is copied to `~/.cla
 - **Version file** (`~/.claude/.nodiclaude-version`): at the end of a successful run, if the repo is a git repo with a commit, it records the installed commit hash (line 1) and the URL of `origin` with any credentials stripped from `http(s)` URLs (line 2). It is state, not a repo file, so it is not in the manifest. If the repo is not a git repo, it is not written (a note is logged) and update checks stay disabled.
 - **Main only**: it refuses to install from any branch other than `main`, or from a detached HEAD: it prints `ERROR: refusing to install from branch '<name>'; switch to main first (git switch main)...` on stderr and exits 1 without changing anything (checked after the commit identity, before anything is created). Setting `NODICLAUDE_ALLOW_ANY_BRANCH=1` skips the refusal and logs a `WARNING`; the update notice compares against `main`, so it may then report a false "outdated". If the repo directory has no `.git` (or git is missing), the branch cannot be known: the check is skipped with a note in the log.
 - **Commit identity**: resolved at the start (see "Commit identity"); if it cannot be resolved, the script fails without changing anything. From the global config, it only records the identity in the log and never writes to any gitconfig. From the variables, it writes `~/.claude/.nodiclaude-identity` and:
-  - with `--cloud`, overwrites `user.name` and `user.email` in the global config and sets `commit.gpgsign=false`, or, if `NODICLAUDE_SIGNING_KEY` is set (validated before anything changes), installs the key to `~/.claude/.nodiclaude-signing-key` and configures SSH signing (`gpg.format`, `user.signingkey`, `gpg.ssh.program`, `commit.gpgsign=true`); without a key it removes a stale key file;
+  - with `--cloud`, overwrites `user.name` and `user.email` in the global config and sets `commit.gpgsign=false`, or, if `NODICLAUDE_SIGNING_KEY` is set in the setup script (validated before anything changes), installs the key to `~/.claude/.nodiclaude-signing-key` and configures SSH signing (`gpg.format`, `user.signingkey`, `gpg.ssh.program`, `commit.gpgsign=true`); without a key it removes a stale key file and installs `openssh-client` if `ssh-keygen` is missing (a warning if it cannot). It also generates the `SessionStart` hook that installs the key from the environment's variables at session start (see "Verified commits");
   - without `--cloud`, writes only the missing keys; if an existing key differs, it warns (`WARNING`) that the hook will block commits until they match and leaves it as is.
 - **`--uninstall`**: removes the files in the manifest (backing up the ones you edited), their hook entries in `settings.json` and the state files (including the signing key). It needs no identity and works from any branch. It leaves the other keys of `settings.json` (including `attribution`), the global git config and the backups.
 
@@ -262,15 +252,15 @@ Text that only mentions `git commit` is never checked: an argument (`grep -rn "g
 | `.nodiclaude-version` | Installed commit and origin URL, read by the update check. | Yes |
 | `.nodiclaude-update-cache` | Last remote check (installed commit, time of the check, remote commit, last notified), created by the `check-update` hook (not by `install.sh`). | Yes |
 | `.nodiclaude-identity` | Expected commit identity (name, email), written when `install.sh` ran with `NODICLAUDE_GIT_*` (cloud); read by the `check-git-identity` hook. | Yes |
-| `.nodiclaude-signing-key` | Private SSH key (mode 0600) for signing commits, written by `install.sh --cloud` when `NODICLAUDE_SIGNING_KEY` is set; used by git and by the identity hook. | Yes |
+| `.nodiclaude-signing-key` | Private SSH key (mode 0600) for signing commits, written at session start by the identity hook (`nodiclaude-apply-identity.sh`) when `NODICLAUDE_SIGNING_KEY` is an environment variable of the cloud environment, or by `install.sh --cloud` when the setup script sets it; used by git. | Yes |
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | Cloud setup fails with exit 1 and an identity error (`--cloud needs your commit identity` or `only one of NODICLAUDE_GIT_NAME / NODICLAUDE_GIT_EMAIL is set`) | The name or email is empty in the script, or only one of them is set. | Fill in both `NODICLAUDE_GIT_NAME` and `NODICLAUDE_GIT_EMAIL` in the setup script. Nothing was changed. |
-| Cloud setup fails with exit 128 (`Remote branch main not found`, or an authentication failure) | The clone failed: `main` does not exist on the remote, or the token is invalid, expired or lacks access to the repo (the repo is private). | Check the repo has a `main` branch. Check that `NODICLAUDE_GH_TOKEN` is valid and not expired, and has Contents: read-only on this repo. |
-| Cloud setup fails with exit 1 and `ERROR: NODICLAUDE_GH_TOKEN is empty` | The token was not filled in; the script stops before cloning and nothing is installed. | Set `NODICLAUDE_GH_TOKEN` in the setup script (see "Security model"). |
+| Cloud setup fails with exit 1 and `ERROR: could not clone nodifox/nodiclaude` | The clone failed: the session runs in the Default environment, `nodifox/nodiclaude` is not in the environment's Repositories or was not selected when starting the session, or `main` does not exist on the remote. Nothing is installed. | Use a dedicated environment with `nodifox/nodiclaude` under Repositories and start a new session with it selected (see "Cloud environment setup"). Check the repo has a `main` branch. |
+| Cloud commits are unsigned although `NODICLAUDE_SIGNING_KEY` is set in the environment | The value is not a valid passphrase-less OpenSSH private key (the hook then writes nothing), `ssh-keygen` is missing in the session (`install.sh --cloud` warns if it could not install `openssh-client`), or the session started before the variable was added. | Paste the whole private key (including the BEGIN/END lines) and start a new session. If `ssh-keygen` is missing, install `openssh-client` from the setup script. |
 | `refusing to install from branch '<name>'` | Local install from a branch other than `main`, or from a detached HEAD. | `git switch main`, then `./install.sh`. For a deliberate exception, set `NODICLAUDE_ALLOW_ANY_BRANCH=1`. |
 | `install.sh` warns `jq is not installed` (and `settings.json` is not updated) | `jq` is missing and could not be installed. Without it the hook cannot verify commits. | Install `jq` and run `./install.sh` again. An existing `settings.json` was left untouched. |
 | Every commit is blocked in the cloud, expecting the platform's identity | The setup ran without `--cloud`, or the platform rewrote the git config after the setup and the identity hook (`nodiclaude-apply-identity.sh`) is missing. | Use the current setup script (it ends with `install.sh --cloud`), change the `# rev:` line and start a new session. |
@@ -280,7 +270,7 @@ Text that only mentions `git commit` is never checked: an argument (`grep -rn "g
 
 ## Tests
 
-`./tests/run.sh` (bash 3.2 compatible; uses a temporary `HOME`, repos and global git config, and ignores git config passed through the environment). CI runs it on every push and pull request on Ubuntu and on macOS with bash 3.2, plus `shellcheck`. It covers, among others, the commit-identity hook (with variables and with global config), the installer (identity resolution, the branch check, manifest, backups and `settings.json` merge), the `check-update` hook, the cloud setup script in this README (syntax, required content and a dry run against a local repo) and the consistency between skills, agents and registered hooks.
+`./tests/run.sh` (bash 3.2 compatible; uses a temporary `HOME`, repos and global git config, and ignores git config passed through the environment). CI runs it on every push and pull request on Ubuntu and on macOS with bash 3.2, plus `shellcheck`. It covers, among others, the commit-identity hook (with variables and with global config), the installer (identity resolution, the branch check, manifest, backups and `settings.json` merge), the `check-update` hook, the cloud setup script in this README (syntax, required content, no secrets, and a dry run against a local repo), the cloud signing key (from the setup script and from the identity hook's environment) and the consistency between skills, agents and registered hooks.
 
 ## Verifying in a session
 
