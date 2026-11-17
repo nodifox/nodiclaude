@@ -71,4 +71,5 @@ End with a one-line commit message for the changes this quest made, in a fenced 
 
 - One line, at most about 72 characters. If the user's rules in your context define a commit message format (for example `rules/git-commits.md`), follow it. Otherwise follow the repository's style and language (check `git log --oneline`), in imperative mood.
 - Describe only this quest's changes, not other uncommitted work in the tree.
-- Do not commit: only propose the message.
+- Do not commit on your own: only propose the message. Show it under a `Commit message` heading, as a fenced code block, and nothing after it except one short question asking whether to commit and push. Do not repeat the message, the branch or any explanation in that question.
+- If a stop hook later asks to commit or push, do not explain why you have not; ask that same short question again, without repeating the message.

@@ -1046,6 +1046,7 @@ git clone -q --bare "$MAIN" "$BARE"
 sed -e "s#^URL=.*#URL=\"file://$BARE\"#" \
     -e 's#^export NODICLAUDE_GIT_NAME=.*#export NODICLAUDE_GIT_NAME="Cloud Test"#' \
     -e 's#^export NODICLAUDE_GIT_EMAIL=.*#export NODICLAUDE_GIT_EMAIL="cloud@x.io"#' \
+    -e 's#^NODICLAUDE_GH_TOKEN=.*#NODICLAUDE_GH_TOKEN="test-token"#' \
     "$SNIP" > "$T/cloud-setup.test.sh"
 if grep -q "^URL=\"file://$BARE\"" "$T/cloud-setup.test.sh"; then
   ok "readme: dry run URL substituted with local repo"
@@ -1057,11 +1058,24 @@ if grep -q "^URL=\"file://$BARE\"" "$T/cloud-setup.test.sh"; then
   check "readme: cloud setup dry run disables signing" "false" "$(git config --global commit.gpgsign)"
   # Unfilled identity: the script fails and changes nothing.
   newhome
-  sed -e "s#^URL=.*#URL=\"file://$BARE\"#" "$SNIP" > "$T/cloud-setup.unfilled.sh"
+  sed -e "s#^URL=.*#URL=\"file://$BARE\"#" \
+      -e 's#^NODICLAUDE_GH_TOKEN=.*#NODICLAUDE_GH_TOKEN="test-token"#' \
+      "$SNIP" > "$T/cloud-setup.unfilled.sh"
   OUT="$(bash "$T/cloud-setup.unfilled.sh" 2>&1)"
   RC=$?
   check "readme: unfilled identity => rc 1" 1 "$RC"
   check "readme: unfilled identity creates nothing" "." "$(tree_of)"
+  # Empty token: the script fails before cloning and installs nothing.
+  newhome
+  sed -e "s#^URL=.*#URL=\"file://$BARE\"#" \
+      -e 's#^export NODICLAUDE_GIT_NAME=.*#export NODICLAUDE_GIT_NAME="Cloud Test"#' \
+      -e 's#^export NODICLAUDE_GIT_EMAIL=.*#export NODICLAUDE_GIT_EMAIL="cloud@x.io"#' \
+      "$SNIP" > "$T/cloud-setup.notoken.sh"
+  OUT="$(bash "$T/cloud-setup.notoken.sh" 2>&1)"
+  RC=$?
+  check "readme: empty token => rc 1" 1 "$RC"
+  case "$OUT" in *"NODICLAUDE_GH_TOKEN is empty"*) ok "readme: empty token prints ERROR";; *) ko "readme: empty token prints ERROR" "$OUT";; esac
+  check "readme: empty token creates nothing" "." "$(tree_of)"
 else
   ko "readme: dry run URL substituted with local repo"
   echo "SKIP: cloud setup dry run not executed (URL substitution failed)"
