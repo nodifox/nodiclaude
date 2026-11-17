@@ -8,6 +8,11 @@
 #      target repo, so `includeIf` sections apply and repo-local config does not (local).
 #   4. otherwise, warn and allow (exit 0). With only one of the two variables, it also warns and allows.
 #
+# The command is parsed like a shell would split it (quotes, escapes, comments, heredocs,
+# `$(...)`, backticks, subshells, `bash -c '...'`), and only a `git` that runs as a command
+# with the `commit` subcommand counts. Text that only mentions `git commit` (an argument,
+# a quoted string, a heredoc body, a comment) is never checked, so it is never blocked.
+#
 # It is a "best effort" safeguard: it does not detect aliases (e.g. `git ci`), dynamically
 # built commands (variables, eval, scripts) or commits made outside the Bash tool.
 # On any unexpected failure (missing jq/git, invalid input, directory that is not a repo,
@@ -15,7 +20,7 @@
 # It only blocks (exit 2) on a real mismatch.
 #
 # Input: JSON on stdin with tool_input.command and cwd.
-# Bash 3.2 compatible (macOS): no mapfile, associative arrays or ${var,,}.
+# Bash 3.2 compatible (macOS): no mapfile, associative arrays, namerefs or ${var,,}.
 
 warn() { echo "check-git-identity: warning: $*" >&2; }
 
@@ -26,205 +31,20 @@ command_str="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/de
   { warn "invalid hook input."; exit 0; }
 [ -n "$command_str" ] || exit 0
 
-# --- `git commit` detection ---------------------------------------------------
-# Prefix: start, `/`, quotes, backtick, `{`, `;&|(` or whitespace. Options before
-# the subcommand: `-x`/`--long` with an optional value (quoted or unquoted).
-sq="'"
-bq='`'
-nl=$'\n'
-pre="(^|[/\"${sq}${bq}{;&|(]|[[:space:]])"
-# Value: a mix of quoted segments, \-escaped characters and plain text.
-optval="(\"[^\"]*\"|${sq}[^${sq}]*${sq}|\\\\.|[^-[:space:];&|\"${sq}${bq})\\\\])(\"[^\"]*\"|${sq}[^${sq}]*${sq}|\\\\.|[^[:space:];&|\"${sq}${bq})\\\\])*"
-opts="([[:space:]]+-[-A-Za-z0-9_.]+([[:space:]]+${optval})?)*"
-commit_re="${pre}git${opts}[[:space:]]+commit([[:space:];&|)\"${sq}${bq}}]|\$)"
-
-[[ $command_str =~ $commit_re ]] || exit 0
-
-# Splits a string into words (removing quotes) up to the first unquoted command
-# separator. Result in the TOK array.
-tokenize() {
-  TOK=()
-  local s="$1" i=0 n=${#1} c cur="" inw=0 q=""
-  while [ "$i" -lt "$n" ]; do
-    c="${s:$i:1}"
-    i=$((i + 1))
-    if [ -n "$q" ]; then
-      if [ "$c" = "$q" ]; then
-        q=""
-      elif [ "$c" = "\\" ] && [ "$q" = '"' ] && [ "$i" -lt "$n" ]; then
-        cur="${cur}${s:$i:1}"
-        i=$((i + 1))
-      else
-        cur="${cur}${c}"
-      fi
-      continue
-    fi
-    case "$c" in
-      '"' | "'") q="$c"; inw=1 ;;
-      '\')
-        if [ "$i" -lt "$n" ]; then cur="${cur}${s:$i:1}"; i=$((i + 1)); inw=1; fi
-        ;;
-      ' ' | $'\t')
-        if [ "$inw" -eq 1 ]; then TOK[${#TOK[@]}]="$cur"; cur=""; inw=0; fi
-        ;;
-      ';' | '&' | '|' | ')' | '`' | $'\n') break ;;
-      *) cur="${cur}${c}"; inw=1 ;;
-    esac
-  done
-  if [ "$inw" -eq 1 ]; then TOK[${#TOK[@]}]="$cur"; fi
-}
-
-# Resolves $2 relative to $1 (supports ~ and absolute paths).
-resolve_dir() {
-  local base="$1" d="$2"
-  d="$(printf '%s' "$d" | sed 's/\\\(.\)/\1/g')"
-  # The literal "~" typed in the command is matched on purpose.
-  # shellcheck disable=SC2088
-  case "$d" in
-    "~") d="$HOME" ;;
-    "~/"*) d="$HOME/${d#"~/"}" ;;
-  esac
-  case "$d" in
-    /*) printf '%s' "$d" ;;
-    *) printf '%s/%s' "$base" "$d" ;;
-  esac
-}
-
-# Evaluates one `git commit`: uses before, m and after. Returns 0 (ok/not verifiable) or 2 (block).
-check_one() {
-# --- Target repo -----------------------------------------------------------------
-cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)" || cwd=""
-[ -n "$cwd" ] || cwd="."
-repo="$cwd"
-
-# `cd <dir>` / `pushd <dir>` followed by `&&`, `||`, `;` or a newline before git (the last one is used).
-cd_re="^(.*[;&|(${bq}{\"${sq}[:space:]])?(cd|pushd)[[:space:]]+(\"[^\"]*\"|${sq}[^${sq}]*${sq}|(\\\\.|[^[:space:];&|\\\\])+)[[:space:]]*(&&|\\|\\||;|${nl})"
-if [[ $before =~ $cd_re ]]; then
-  tokenize "cd ${BASH_REMATCH[3]}"
-  if [ "${#TOK[@]}" -ge 2 ]; then repo="$(resolve_dir "$repo" "${TOK[1]}")"; fi
-fi
-
-# git options between `git` and `commit`: -C <dir> and -c key=value.
-gitopts="${m#*git}"
-gitopts="${gitopts%commit}"
-tokenize "$gitopts"
-cfg_args=()
-i=0
-while [ "$i" -lt "${#TOK[@]}" ]; do
-  case "${TOK[$i]}" in
-    -C)
-      i=$((i + 1))
-      if [ "$i" -lt "${#TOK[@]}" ]; then repo="$(resolve_dir "$repo" "${TOK[$i]}")"; fi
-      ;;
-    -c)
-      i=$((i + 1))
-      if [ "$i" -lt "${#TOK[@]}" ]; then cfg_args[${#cfg_args[@]}]="-c"; cfg_args[${#cfg_args[@]}]="${TOK[$i]}"; fi
-      ;;
-  esac
-  i=$((i + 1))
-done
-
-if [ ! -d "$repo" ] || ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
-  warn "could not resolve a git repo for the commit ('$repo'); identity not verified."
-  return 0
-fi
-
-# Inline environment variables right before git (GIT_AUTHOR_NAME=x git commit).
-env_args=()
-seg="${before##*[;&|(\`{${nl}]}"
-tokenize "$seg"
-for t in ${TOK[@]+"${TOK[@]}"}; do
-  case "$t" in
-    GIT_AUTHOR_NAME=* | GIT_AUTHOR_EMAIL=* | GIT_COMMITTER_NAME=* | GIT_COMMITTER_EMAIL=*)
-      v="${t#*=}"
-      v="${v%"${v##*[![:space:]]}"}"
-      env_args[${#env_args[@]}]="${t%%=*}=${v}"
-      ;;
-  esac
-done
-
-# --author="Name <email>" (after `commit`).
-author_override=""
-tokenize "$after"
-i=0
-while [ "$i" -lt "${#TOK[@]}" ]; do
-  case "${TOK[$i]}" in
-    --author=*) author_override="${TOK[$i]#--author=}" ;;
-    --author)
-      i=$((i + 1))
-      if [ "$i" -lt "${#TOK[@]}" ]; then author_override="${TOK[$i]}"; fi
-      ;;
-  esac
-  i=$((i + 1))
-done
-
-# --- Expected identity ----------------------------------------------------------
-# Sources 1 and 2 were resolved once (see the header); source 3 depends on the repo.
-EXP_NAME="$FIXED_NAME"
-EXP_EMAIL="$FIXED_EMAIL"
-if [ -z "$EXP_NAME" ]; then
-  EXP_NAME="$(git -C "$repo" config --global --includes user.name 2>/dev/null)" || EXP_NAME=""
-  EXP_EMAIL="$(git -C "$repo" config --global --includes user.email 2>/dev/null)" || EXP_EMAIL=""
-  if [ -z "$EXP_NAME" ] || [ -z "$EXP_EMAIL" ]; then
-    warn "no identity source (neither NODICLAUDE_GIT_NAME/EMAIL, ~/.claude/.nodiclaude-identity nor git config --global user.name/user.email); identity not verified."
-    return 0
-  fi
-fi
-
-# --- Effective identity -------------------------------------------------------
-# If git var fails (no identity configured) it is treated as empty.
-get_ident() {
-  env ${env_args[@]+"${env_args[@]}"} git -C "$repo" ${cfg_args[@]+"${cfg_args[@]}"} var "$1" 2>/dev/null
-}
-ident_name() { local v="$1"; printf '%s' "${v%% <*}"; }
-ident_email() { local v="$1"; v="${v#*<}"; printf '%s' "${v%%>*}"; }
-
-a_raw="$(get_ident GIT_AUTHOR_IDENT)" || a_raw=""
-c_raw="$(get_ident GIT_COMMITTER_IDENT)" || c_raw=""
-if [ -n "$a_raw" ]; then a_name="$(ident_name "$a_raw")"; a_email="$(ident_email "$a_raw")"; else a_name=""; a_email=""; fi
-if [ -n "$c_raw" ]; then c_name="$(ident_name "$c_raw")"; c_email="$(ident_email "$c_raw")"; else c_name=""; c_email=""; fi
-
-if [ -n "$author_override" ]; then
-  case "$author_override" in
-    *"<"*">"*)
-      a_name="${author_override%%<*}"
-      a_name="${a_name%"${a_name##*[![:space:]]}"}"
-      a_email="${author_override#*<}"
-      a_email="${a_email%%>*}"
-      ;;
-    *)
-      # No email: git looks up an existing author; not verifiable here.
-      warn "--author not in 'Name <email>' format; author not verified."
-      a_name="$EXP_NAME"
-      a_email="$EXP_EMAIL"
-      ;;
-  esac
-fi
-
-lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
-want_email="$(lower "$EXP_EMAIL")"
-ok=1
-[ "$a_name" = "$EXP_NAME" ] || ok=0
-[ "$c_name" = "$EXP_NAME" ] || ok=0
-[ "$(lower "$a_email")" = "$want_email" ] || ok=0
-[ "$(lower "$c_email")" = "$want_email" ] || ok=0
-[ "$ok" -eq 1 ] && return 0
-
-clean() { printf '%s' "$1" | LC_ALL=C tr -cd '[:print:]' | cut -c1-100; }
-{
-  echo "check-git-identity: commit blocked: the git identity does not match the expected one."
-  echo "  author    : current name='$(clean "$a_name")' current email='$(clean "$a_email")'"
-  echo "  committer : current name='$(clean "$c_name")' current email='$(clean "$c_email")'"
-  echo "  expected  : name='$(clean "$EXP_NAME")' email='$(clean "$EXP_EMAIL")'"
-  echo "Fix it with:"
-  printf '  git config user.name %q && git config user.email %q\n' "$EXP_NAME" "$EXP_EMAIL"
-} >&2
-  return 2
-}
+# Cheap pre-check: without both words there is nothing to parse.
+case "$command_str" in *git*) ;; *) exit 0 ;; esac
+case "$command_str" in *commit*) ;; *) exit 0 ;; esac
 
 command -v git >/dev/null 2>&1 || { warn "git not available; identity not verified."; exit 0; }
 
-# Expected identity, sources 1 and 2 (see header). Empty means: resolve per repo (source 3).
+# Byte-wise string handling in this shell only (not exported to git).
+LC_ALL=C
+
+cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)" || cwd=""
+[ -n "$cwd" ] || cwd="."
+
+# --- Expected identity, sources 1 and 2 (see header) ---------------------------------
+# Empty means: resolve per repo (source 3).
 FIXED_NAME=""
 FIXED_EMAIL=""
 if [ -n "${NODICLAUDE_GIT_NAME:-}" ] && [ -n "${NODICLAUDE_GIT_EMAIL:-}" ]; then
@@ -242,30 +62,504 @@ elif [ -f "$HOME/.claude/.nodiclaude-identity" ]; then
   fi
 fi
 
-# All `git commit`s in the command are evaluated; one mismatch is enough to block.
-rest="$command_str"
-consumed=""
-status=0
-while [[ $rest =~ $commit_re ]]; do
-  m="${BASH_REMATCH[0]}"
-  p="${BASH_REMATCH[1]}" # the prefix character (separator, quote...) belongs to `before`
-  # Text before and after the detected fragment.
-  case "$m" in
-    *commit)
-      before="${rest%"$m"}"
-      after=""
+# --- Helpers ----------------------------------------------------------------------
+# Resolves directory $2 relative to $1 (supports a leading ~ or $HOME, and absolute paths).
+resolve_dir() {
+  local base="$1" d="$2"
+  # The literal "~" typed in the command is matched on purpose.
+  # shellcheck disable=SC2088
+  case "$d" in
+    "~" | '$HOME' | '${HOME}') d="$HOME" ;;
+    "~/"*) d="$HOME/${d#"~/"}" ;;
+    '$HOME/'*) d="$HOME/${d#'$HOME/'}" ;;
+    '${HOME}/'*) d="$HOME/${d#'${HOME}/'}" ;;
+  esac
+  case "$d" in
+    /*) printf '%s' "$d" ;;
+    *) printf '%s/%s' "$base" "$d" ;;
+  esac
+}
+
+# git environment variables that change the identity or the repo of a commit.
+is_git_env() {
+  case "$1" in
+    GIT_AUTHOR_NAME=* | GIT_AUTHOR_EMAIL=* | GIT_COMMITTER_NAME=* | GIT_COMMITTER_EMAIL=* | GIT_DIR=* | GIT_WORK_TREE=*) return 0 ;;
+  esac
+  return 1
+}
+
+# --- Identity check of one `git commit` ------------------------------------------------
+# Uses: CK_DIR (the shell's directory), CK_GARGS (git options that pick the repo: -C,
+# --git-dir, --work-tree), CK_CFG (-c options), CK_ENV (NAME=value), CK_AUTHOR (--author value).
+# Returns 0 (ok or not verifiable) or 2 (block).
+check_commit() {
+  local exp_name exp_email a_raw c_raw a_name a_email c_name c_email want_email ok
+  if [ ! -d "$CK_DIR" ] || ! env ${CK_ENV[@]+"${CK_ENV[@]}"} git -C "$CK_DIR" ${CK_GARGS[@]+"${CK_GARGS[@]}"} rev-parse --git-dir >/dev/null 2>&1; then
+    warn "could not resolve a git repo for the commit ('$CK_DIR'); identity not verified."
+    return 0
+  fi
+
+  # Expected identity: sources 1 and 2 were resolved once; source 3 depends on the repo.
+  exp_name="$FIXED_NAME"
+  exp_email="$FIXED_EMAIL"
+  if [ -z "$exp_name" ]; then
+    exp_name="$(env ${CK_ENV[@]+"${CK_ENV[@]}"} git -C "$CK_DIR" ${CK_GARGS[@]+"${CK_GARGS[@]}"} config --global --includes user.name 2>/dev/null)" || exp_name=""
+    exp_email="$(env ${CK_ENV[@]+"${CK_ENV[@]}"} git -C "$CK_DIR" ${CK_GARGS[@]+"${CK_GARGS[@]}"} config --global --includes user.email 2>/dev/null)" || exp_email=""
+    if [ -z "$exp_name" ] || [ -z "$exp_email" ]; then
+      warn "no identity source (neither NODICLAUDE_GIT_NAME/EMAIL, ~/.claude/.nodiclaude-identity nor git config --global user.name/user.email); identity not verified."
+      return 0
+    fi
+  fi
+
+  # Effective identity (repo config, environment and the command's own -c and variables).
+  # If git var fails (no identity configured) it is treated as empty.
+  a_raw="$(env ${CK_ENV[@]+"${CK_ENV[@]}"} git -C "$CK_DIR" ${CK_GARGS[@]+"${CK_GARGS[@]}"} ${CK_CFG[@]+"${CK_CFG[@]}"} var GIT_AUTHOR_IDENT 2>/dev/null)" || a_raw=""
+  c_raw="$(env ${CK_ENV[@]+"${CK_ENV[@]}"} git -C "$CK_DIR" ${CK_GARGS[@]+"${CK_GARGS[@]}"} ${CK_CFG[@]+"${CK_CFG[@]}"} var GIT_COMMITTER_IDENT 2>/dev/null)" || c_raw=""
+  a_name="${a_raw%% <*}"
+  a_email="${a_raw#*<}"
+  a_email="${a_email%%>*}"
+  c_name="${c_raw%% <*}"
+  c_email="${c_raw#*<}"
+  c_email="${c_email%%>*}"
+  [ -n "$a_raw" ] || { a_name=""; a_email=""; }
+  [ -n "$c_raw" ] || { c_name=""; c_email=""; }
+
+  if [ -n "$CK_AUTHOR" ]; then
+    case "$CK_AUTHOR" in
+      *"<"*">"*)
+        a_name="${CK_AUTHOR%%<*}"
+        a_name="${a_name%"${a_name##*[![:space:]]}"}"
+        a_email="${CK_AUTHOR#*<}"
+        a_email="${a_email%%>*}"
+        ;;
+      *)
+        # No email: git looks up an existing author; not verifiable here.
+        warn "--author not in 'Name <email>' format; author not verified."
+        a_name="$exp_name"
+        a_email="$exp_email"
+        ;;
+    esac
+  fi
+
+  want_email="$(printf '%s' "$exp_email" | tr '[:upper:]' '[:lower:]')"
+  ok=1
+  [ "$a_name" = "$exp_name" ] || ok=0
+  [ "$c_name" = "$exp_name" ] || ok=0
+  [ "$(printf '%s' "$a_email" | tr '[:upper:]' '[:lower:]')" = "$want_email" ] || ok=0
+  [ "$(printf '%s' "$c_email" | tr '[:upper:]' '[:lower:]')" = "$want_email" ] || ok=0
+  [ "$ok" -eq 1 ] && return 0
+
+  clean() { printf '%s' "$1" | tr -cd '[:print:]' | cut -c1-100; }
+  {
+    echo "check-git-identity: commit blocked: the git identity does not match the expected one."
+    echo "  author    : current name='$(clean "$a_name")' current email='$(clean "$a_email")'"
+    echo "  committer : current name='$(clean "$c_name")' current email='$(clean "$c_email")'"
+    echo "  expected  : name='$(clean "$exp_name")' email='$(clean "$exp_email")'"
+    echo "Fix it with:"
+    printf '  git config user.name %q && git config user.email %q\n' "$exp_name" "$exp_email"
+  } >&2
+  return 2
+}
+
+# --- Shell parser -------------------------------------------------------------------
+# State: S (text), P (position), N (length); CTX_DIR (directory after `cd`/`pushd`);
+# CTX_ENV (git variables set with `export`); INH_ENV (variables passed down to `bash -c`);
+# HD_D/HD_S (pending heredoc delimiters and their <<- flag). The current command's words
+# (W), word (cur, inw) and redirection flag (redir) are locals of parse_list, which the
+# helpers below see through bash's dynamic scoping.
+STATUS=0
+CTX_DIR="$cwd"
+CTX_ENV=()
+INH_ENV=()
+HD_D=()
+HD_S=()
+
+endword() {
+  if [ "$inw" -eq 1 ]; then
+    if [ "$redir" -eq 1 ]; then
+      redir=0 # redirection target, not a word of the command
+    else
+      W[${#W[@]}]="$cur"
+    fi
+  fi
+  cur=""
+  inw=0
+}
+
+# Skips the bodies of the heredocs started on the line that just ended.
+skip_heredocs() {
+  local k rest line cmp body d
+  k=0
+  while [ "$k" -lt "${#HD_D[@]}" ]; do
+    d="${HD_D[$k]}"
+    if [ "${HD_S[$k]}" -eq 0 ]; then
+      # Fast path: find the delimiter line with one pattern match instead of line by line.
+      rest="${S:$P}"
+      if [ "$rest" = "$d" ] || [ "${rest#"$d"$'\n'}" != "$rest" ]; then
+        body=""
+      else
+        body="${rest%%$'\n'"$d"$'\n'*}"
+        if [ "$body" = "$rest" ]; then body="${rest%$'\n'"$d"}"; fi
+        if [ "$body" = "$rest" ]; then P=$N; k=$((k + 1)); continue; fi # no delimiter: runs to the end
+        body="$body"$'\n'
+      fi
+      P=$((P + ${#body} + ${#d} + 1))
+      [ "$P" -le "$N" ] || P=$N
+      k=$((k + 1))
+      continue
+    fi
+    while [ "$P" -lt "$N" ]; do
+      rest="${S:$P}"
+      line="${rest%%$'\n'*}"
+      if [ "$line" = "$rest" ]; then P=$N; else P=$((P + ${#line} + 1)); fi
+      cmp="$line"
+      if [ "${HD_S[$k]}" -eq 1 ]; then cmp="${cmp#"${cmp%%[!$'\t']*}"}"; fi
+      [ "$cmp" = "$d" ] && break
+    done
+    k=$((k + 1))
+  done
+  HD_D=()
+  HD_S=()
+}
+
+# Reads a heredoc operator at P (just after `<<`) and registers its delimiter.
+read_heredoc() {
+  local strip=0 delim="" c q=""
+  if [ "${S:$P:1}" = "-" ]; then strip=1; P=$((P + 1)); fi
+  while [ "$P" -lt "$N" ]; do
+    c="${S:$P:1}"
+    case "$c" in ' ' | $'\t') P=$((P + 1)) ;; *) break ;; esac
+  done
+  while [ "$P" -lt "$N" ]; do
+    c="${S:$P:1}"
+    if [ -n "$q" ]; then
+      if [ "$c" = "$q" ]; then q=""; else delim="$delim$c"; fi
+      P=$((P + 1))
+      continue
+    fi
+    case "$c" in
+      "'" | '"') q="$c" ;;
+      '\') P=$((P + 1)); delim="$delim${S:$P:1}" ;;
+      ' ' | $'\t' | $'\n' | ';' | '&' | '|' | '<' | '>' | '(' | ')') break ;;
+      *) delim="$delim$c" ;;
+    esac
+    P=$((P + 1))
+  done
+  case "$delim" in
+    "" | *[!0-9]*) ;;
+    *) return 0 ;; # digits only: an arithmetic shift such as $((1<<2)), not a heredoc
+  esac
+  [ -n "$delim" ] || return 0
+  HD_D[${#HD_D[@]}]="$delim"
+  HD_S[${#HD_S[@]}]="$strip"
+}
+
+# Parses a nested command list ($( ), backticks, subshell) in its own directory and
+# environment context: a `cd` inside does not leak out.
+nested() { # nested <end>
+  local saved_dir="$CTX_DIR"
+  local saved_env=(${CTX_ENV[@]+"${CTX_ENV[@]}"})
+  parse_list "$1"
+  CTX_DIR="$saved_dir"
+  CTX_ENV=(${saved_env[@]+"${saved_env[@]}"})
+}
+
+# Reads a double-quoted string at P (just after the opening quote) into cur.
+dquote() {
+  local c n rest chunk
+  while [ "$P" -lt "$N" ]; do
+    rest="${S:$P}"
+    chunk="${rest%%[\"\\\$\`]*}"
+    if [ -n "$chunk" ]; then
+      cur="$cur$chunk"
+      P=$((P + ${#chunk}))
+      continue
+    fi
+    c="${S:$P:1}"
+    case "$c" in
+      '"') P=$((P + 1)); return 0 ;;
+      '\')
+        n="${S:$((P + 1)):1}"
+        case "$n" in
+          '"' | '\' | '$' | '`') cur="$cur$n"; P=$((P + 2)) ;;
+          $'\n') P=$((P + 2)) ;;
+          *) cur="$cur\\"; P=$((P + 1)) ;;
+        esac
+        ;;
+      '$')
+        if [ "${S:$((P + 1)):1}" = "(" ]; then
+          P=$((P + 2)); nested ")"; cur="${cur}_"
+        else
+          cur="$cur\$"; P=$((P + 1))
+        fi
+        ;;
+      '`') P=$((P + 1)); nested '`'; cur="${cur}_" ;;
+    esac
+  done
+}
+
+# Parses the text in S from P until the end, or until the closing $1 (")" or "`").
+parse_list() {
+  local end="$1" W=() cur="" inw=0 redir=0 c rest chunk
+  while [ "$P" -lt "$N" ]; do
+    rest="${S:$P}"
+    chunk="${rest%%[[:space:]\;\&\|\(\)\`\$\'\"\\\#\<\>]*}"
+    if [ -n "$chunk" ]; then
+      cur="$cur$chunk"
+      inw=1
+      P=$((P + ${#chunk}))
+      continue
+    fi
+    c="${S:$P:1}"
+    case "$c" in
+      $'\n') endword; emit; P=$((P + 1)); skip_heredocs ;;
+      ' ' | $'\t' | $'\r' | $'\f' | $'\v') endword; P=$((P + 1)) ;;
+      ';' | '&' | '|') endword; emit; P=$((P + 1)) ;;
+      '(')
+        P=$((P + 1))
+        if [ "$inw" -eq 0 ] && [ "${#W[@]}" -eq 0 ]; then
+          nested ")"
+        else
+          cur="$cur("; inw=1
+        fi
+        ;;
+      ')')
+        endword; emit; P=$((P + 1))
+        [ "$end" = ")" ] && return 0
+        ;;
+      '`')
+        P=$((P + 1))
+        if [ "$end" = '`' ]; then endword; emit; return 0; fi
+        nested '`'; cur="${cur}_"; inw=1
+        ;;
+      '$')
+        if [ "${S:$((P + 1)):1}" = "(" ]; then
+          P=$((P + 2)); nested ")"; cur="${cur}_"
+        else
+          cur="$cur\$"; P=$((P + 1))
+        fi
+        inw=1
+        ;;
+      "'")
+        P=$((P + 1))
+        rest="${S:$P}"
+        chunk="${rest%%\'*}"
+        cur="$cur$chunk"
+        P=$((P + ${#chunk} + 1))
+        inw=1
+        ;;
+      '"') P=$((P + 1)); dquote; inw=1 ;;
+      '\')
+        if [ "${S:$((P + 1)):1}" = $'\n' ]; then
+          P=$((P + 2))
+        else
+          cur="$cur${S:$((P + 1)):1}"; inw=1; P=$((P + 2))
+        fi
+        ;;
+      '#')
+        if [ "$inw" -eq 0 ]; then
+          rest="${S:$P}"
+          chunk="${rest%%$'\n'*}"
+          P=$((P + ${#chunk}))
+        else
+          cur="$cur#"; P=$((P + 1))
+        fi
+        ;;
+      '<' | '>')
+        if [ "${S:$P:2}" = "<<" ] && [ "${S:$P:3}" != "<<<" ]; then
+          endword; P=$((P + 2)); read_heredoc
+        else
+          # A file descriptor number right before the operator is not a word (2>&1).
+          case "$cur" in "" | *[!0-9]*) endword ;; *) cur=""; inw=0 ;; esac
+          P=$((P + 1))
+          while [ "$P" -lt "$N" ]; do
+            case "${S:$P:1}" in '<' | '>' | '&') P=$((P + 1)) ;; *) break ;; esac
+          done
+          redir=1
+        fi
+        ;;
+      *) cur="$cur$c"; inw=1; P=$((P + 1)) ;;
+    esac
+  done
+  endword
+  emit
+}
+
+# Parses a whole script (for `bash -c '...'`) with its own position and heredoc state.
+parse_string() { # parse_string <text>
+  local sS="$S" sP="$P" sN="$N"
+  local sD=(${HD_D[@]+"${HD_D[@]}"}) sH=(${HD_S[@]+"${HD_S[@]}"})
+  S="$1"
+  P=0
+  N=${#S}
+  HD_D=()
+  HD_S=()
+  parse_list ""
+  S="$sS"
+  P="$sP"
+  N="$sN"
+  HD_D=(${sD[@]+"${sD[@]}"})
+  HD_S=(${sH[@]+"${sH[@]}"})
+}
+
+# Handles the command in W (then clears it): `cd`/`pushd`, `export`, `bash -c`, `git commit`.
+emit() {
+  local n=${#W[@]} i=0 w b j sub found script envs=() saved_dir saved_inh
+  if [ "$n" -eq 0 ]; then return 0; fi
+  # Keywords, wrappers and NAME=value assignments before the command.
+  while [ "$i" -lt "$n" ]; do
+    w="${W[$i]}"
+    case "$w" in
+      '{' | '!' | if | then | do | else | elif | while | until | time | nohup | command | exec | builtin)
+        i=$((i + 1))
+        ;;
+      sudo | doas)
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case "${W[$i]}" in
+            -u | -g | -C | -D | -h | -p | -U | -r | -t | -T) i=$((i + 2)) ;;
+            --) i=$((i + 1)); break ;;
+            -*) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      env)
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case "${W[$i]}" in
+            -u | -C | -S) i=$((i + 2)) ;;
+            --) i=$((i + 1)); break ;;
+            -*) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      nice)
+        i=$((i + 1))
+        case "${W[$i]}" in -n) i=$((i + 2)) ;; -*) i=$((i + 1)) ;; esac
+        ;;
+      timeout)
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case "${W[$i]}" in
+            -s | -k) i=$((i + 2)) ;;
+            -*) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        i=$((i + 1)) # duration
+        ;;
+      [A-Za-z_]*=*)
+        case "${w%%=*}" in *[!A-Za-z0-9_]*) break ;; esac
+        if is_git_env "$w"; then envs[${#envs[@]}]="$w"; fi
+        i=$((i + 1))
+        ;;
+      *) break ;;
+    esac
+  done
+  if [ "$i" -ge "$n" ]; then W=(); return 0; fi
+
+  b="${W[$i]##*/}"
+  case "$b" in
+    cd | pushd)
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        case "${W[$j]}" in --) j=$((j + 1)); break ;; -?*) j=$((j + 1)) ;; *) break ;; esac
+      done
+      if [ "$j" -ge "$n" ]; then
+        CTX_DIR="$HOME"
+      elif [ "${W[$j]}" != "-" ]; then
+        CTX_DIR="$(resolve_dir "$CTX_DIR" "${W[$j]}")"
+      fi
       ;;
-    *)
-      before="${rest%%"$m"*}"
-      after="${rest#*"$m"}"
-      after="${m: -1}${after}"
-      m="${m%?}"
+    export)
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        if is_git_env "${W[$j]}"; then CTX_ENV[${#CTX_ENV[@]}]="${W[$j]}"; fi
+        j=$((j + 1))
+      done
+      ;;
+    bash | sh | zsh | dash | ksh)
+      # bash [options] -c 'script': the script is the first argument after the options.
+      j=$((i + 1))
+      found=0
+      while [ "$j" -lt "$n" ]; do
+        case "${W[$j]}" in
+          --) j=$((j + 1)); break ;;
+          -o | +o) j=$((j + 2)) ;;
+          --*) j=$((j + 1)) ;;
+          -*c*) found=1; j=$((j + 1)) ;;
+          [-+]*) j=$((j + 1)) ;;
+          *) break ;;
+        esac
+      done
+      if [ "$found" -eq 1 ] && [ "$j" -lt "$n" ]; then
+        script="${W[$j]}"
+        saved_dir="$CTX_DIR"
+        saved_inh=(${INH_ENV[@]+"${INH_ENV[@]}"})
+        INH_ENV=(${INH_ENV[@]+"${INH_ENV[@]}"} ${CTX_ENV[@]+"${CTX_ENV[@]}"} ${envs[@]+"${envs[@]}"})
+        local saved_ctx_env=(${CTX_ENV[@]+"${CTX_ENV[@]}"})
+        CTX_ENV=()
+        parse_string "$script"
+        CTX_DIR="$saved_dir"
+        CTX_ENV=(${saved_ctx_env[@]+"${saved_ctx_env[@]}"})
+        INH_ENV=(${saved_inh[@]+"${saved_inh[@]}"})
+      fi
+      ;;
+    git)
+      # git [global options] <subcommand> [arguments]
+      CK_GARGS=()
+      CK_CFG=()
+      sub=""
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        w="${W[$j]}"
+        case "$w" in
+          -C)
+            j=$((j + 1))
+            CK_GARGS[${#CK_GARGS[@]}]="-C"
+            CK_GARGS[${#CK_GARGS[@]}]="$(resolve_dir . "${W[$j]}")"
+            ;;
+          -c)
+            j=$((j + 1))
+            CK_CFG[${#CK_CFG[@]}]="-c"
+            CK_CFG[${#CK_CFG[@]}]="${W[$j]}"
+            ;;
+          --git-dir=* | --work-tree=*) CK_GARGS[${#CK_GARGS[@]}]="$w" ;;
+          --git-dir | --work-tree)
+            j=$((j + 1))
+            CK_GARGS[${#CK_GARGS[@]}]="$w=${W[$j]}"
+            ;;
+          --namespace | --super-prefix | --config-env) j=$((j + 1)) ;;
+          -*) ;;
+          *) sub="$w"; break ;;
+        esac
+        j=$((j + 1))
+      done
+      if [ "$sub" = "commit" ]; then
+        CK_AUTHOR=""
+        j=$((j + 1))
+        while [ "$j" -lt "$n" ]; do
+          case "${W[$j]}" in
+            --) break ;;
+            --author=*) CK_AUTHOR="${W[$j]#--author=}" ;;
+            --author) j=$((j + 1)); CK_AUTHOR="${W[$j]}" ;;
+          esac
+          j=$((j + 1))
+        done
+        CK_DIR="$CTX_DIR"
+        CK_ENV=(${INH_ENV[@]+"${INH_ENV[@]}"} ${CTX_ENV[@]+"${CTX_ENV[@]}"} ${envs[@]+"${envs[@]}"})
+        check_commit || STATUS=2
+      fi
       ;;
   esac
-  before="${consumed}${before}${p}"
-  m="${m#"$p"}"
-  check_one || status=2
-  consumed="${before}${m}"
-  rest="$after"
-done
-exit "$status"
+  W=()
+}
+
+# All `git commit`s in the command are evaluated; one mismatch is enough to block.
+S=""
+P=0
+N=0
+parse_string "$command_str"
+exit "$STATUS"

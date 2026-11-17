@@ -103,6 +103,52 @@ hook_case "pushd && git commit" 2 "$T/good" "pushd $T/other && git commit -m x"
 hook_case "inline variable after a newline" 2 "$T/good" "echo a
 GIT_AUTHOR_EMAIL=bad@example.com git commit -m x"
 
+# No false positives: `git commit` that is only text, never a command that runs
+hook_case "no fp: grep for the text" 0 "$T/bad" 'grep -rn "git commit" .'
+hook_case "no fp: echo quoted" 0 "$T/bad" 'echo "git commit"'
+hook_case "no fp: echo unquoted" 0 "$T/bad" 'echo git commit -m x'
+hook_case "no fp: single-quoted argument" 0 "$T/bad" "gh pr create --body 'Then run git commit to finish'"
+hook_case "no fp: git log --grep with the text" 0 "$T/bad" 'git log --grep "git commit"'
+hook_case "no fp: pipe into grep" 0 "$T/bad" "git log --oneline | grep 'git commit'"
+hook_case "no fp: heredoc body" 0 "$T/bad" "cat > notes.md <<'EOF'
+Then run git commit -m x
+EOF"
+hook_case "no fp: heredoc with <<-" 0 "$T/bad" "cat <<-EOF
+	git commit -m x
+	EOF
+echo done"
+hook_case "no fp: comment" 0 "$T/bad" "ls # then git commit -m x"
+hook_case "no fp: escaped quotes in a string" 0 "$T/bad" 'echo "say \"git commit\" now"'
+hook_case "no fp: git commit-tree" 0 "$T/bad" "git commit-tree HEAD^{tree} -m x"
+hook_case "no fp: commit as an argument" 0 "$T/bad" "git show commit"
+
+# Still detected
+hook_case "heredoc message with parens" 2 "$T/bad" "git commit -m \"\$(cat <<'EOF'
+Fix things (and more)
+EOF
+)\""
+hook_case "command after a heredoc" 2 "$T/bad" "cat > f <<'EOF'
+text
+EOF
+git commit -m x"
+hook_case "commit inside \$( )" 2 "$T/bad" 'echo "$(git commit -m x)"'
+hook_case "commit inside backticks" 2 "$T/bad" 'echo `git commit -m x`'
+hook_case "quoted git word" 2 "$T/bad" '"git" commit -m x'
+hook_case "subshell with cd" 2 "$T/good" "(cd $T/other && git commit -m x)"
+hook_case "cd inside a subshell does not leak" 0 "$T/good" "(cd $T/other && ls); git commit -m x"
+hook_case "chained relative cds" 2 "$T" "cd good && cd ../other && git commit -m x"
+hook_case "export then commit" 2 "$T/good" "export GIT_AUTHOR_EMAIL=bad@example.com; git commit -m x"
+hook_case "GIT_DIR to another repo" 2 "$T/good" "GIT_DIR=$T/other/.git GIT_WORK_TREE=$T/other git commit -m x"
+hook_case "--git-dir to another repo" 2 "$T/good" "git --git-dir=$T/other/.git --work-tree=$T/other commit -m x"
+hook_case "if git commit" 2 "$T/bad" "if git commit -m x; then echo ok; fi"
+hook_case "timeout wrapper" 2 "$T/bad" "timeout 10 git commit -m x"
+hook_case "env wrapper" 2 "$T/good" "env GIT_AUTHOR_NAME=Bad git commit -m x"
+hook_case "sh -lc" 2 "$T/good" "sh -lc 'cd $T/other && git commit -m x'"
+hook_case "redirections" 2 "$T/bad" "git commit -m x 2>&1 >/dev/null"
+hook_case "cd with redirection" 2 "$T/good" "cd $T/other 2>/dev/null && git commit -m x"
+hook_case "line continuation" 2 "$T/bad" "git \\
+  commit -m x"
+
 run_hook "$T/bad" "git commit -m x"
 case "$ERR" in *"git config user.name"*"Bad Name"*|*"Bad Name"*"git config user.name"*) ok "hook: the message includes the fix command" ;; *) ko "hook: block message" "$ERR" ;; esac
 

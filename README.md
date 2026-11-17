@@ -189,26 +189,23 @@ Create `rules/<name>.md` (Markdown without frontmatter). It is copied to `~/.cla
 
 ## The `check-git-identity` hook
 
-PreToolUse on `Bash`. If the command includes `git commit` (also chained with `&&`, `;`…, with a path like `/usr/bin/git`, inside `bash -c "..."` or with options like `-C dir` / `-c k=v`), it computes the commit's effective identity and compares it with the expected identity (`NODICLAUDE_GIT_NAME/EMAIL` if both are set; otherwise `git config --global user.name/user.email`):
+PreToolUse on `Bash`. It reads the command the way the shell would split it (quotes, escapes, comments, heredocs, `$(...)`, backticks, subshells, `bash -c '...'`) and checks every `git commit` that actually runs as a command (also chained with `&&`, `;`, newlines…, with a path like `/usr/bin/git`, after wrappers such as `env`, `sudo`, `timeout` or `if`, or with options like `-C dir` / `-c k=v`). For each one it computes the commit's effective identity and compares it with the expected identity (see "Commit identity"):
 
-- target repo: the one from `-C <dir>`, from a preceding `cd <dir> &&`, or the session's `cwd`;
-- effective identity: the one given by `git var GIT_AUTHOR_IDENT` / `GIT_COMMITTER_IDENT` (repo config and environment), overridden by whatever the command itself sets (`-c user.name=`, `-c user.email=`, `--author=`, inline `GIT_AUTHOR_NAME=`…);
+- target repo: the session's `cwd`, changed by earlier `cd <dir>` / `pushd <dir>` in the same command (a `cd` inside `( ... )` or `$( ... )` does not leak out), then by `-C <dir>`, `--git-dir` / `--work-tree` or `GIT_DIR=` / `GIT_WORK_TREE=`;
+- effective identity: the one given by `git var GIT_AUTHOR_IDENT` / `GIT_COMMITTER_IDENT` (repo config and environment), overridden by whatever the command itself sets (`-c user.name=`, `-c user.email=`, `--author=`, inline or exported `GIT_AUTHOR_NAME=`…);
 - the name is compared case-sensitively; the email, case-insensitively;
 - they match → allows;
 - they do not match → blocks (exit 2) and shows the values and the command to fix it;
-- `cd <dir>` or `pushd <dir>` before the commit, followed by `&&`, `||`, `;` or a newline (also inside `bash -c "..."`), sets the target repo;
 - no identity source (neither variables nor global config), only one of the two variables, outside a repo, no `git` or no `jq`, or invalid input → warns on stderr and allows (exit 0).
 
-**It is a "best effort" safeguard**: it only intercepts commits Claude makes via the Bash tool (not the ones a developer makes in a terminal). All `git commit` invocations in the command are checked. It does not cover:
+Text that only mentions `git commit` is never checked: an argument (`grep -rn "git commit" .`, `echo git commit`, `gh pr create --body '...'`), a heredoc body or a comment.
 
-- aliases (`git ci`) or dynamically built commands (variables, `eval`, scripts);
-- chained relative `cd`s (`cd a && cd b && git commit`: only the last `cd` is applied);
-- `GIT_DIR=` / `git --git-dir=`;
+**It is a "best effort" safeguard**: it only intercepts commits Claude makes via the Bash tool (not the ones a developer makes in a terminal). It does not cover:
+
+- aliases (`git ci`) or dynamically built commands (variables such as `cd "$dir"`, `eval`, scripts);
+- commits run by other programs (`xargs git commit`, `find -exec`, a script fed to a shell through a heredoc: `bash <<EOF`);
 - `--reset-author`;
-- variables exported in a separate command (`export GIT_AUTHOR_NAME=x && git commit`);
 - identity changed earlier in the same command (`git config user.email x && git commit`).
-
-It can also block harmless commands that only mention `git commit` in quoted text (`grep -rn "git commit" .`), when the current repo's identity differs from the expected one.
 
 ## The `check-update` hooks
 
