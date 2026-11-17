@@ -271,6 +271,7 @@ cmp -s "$S" "$T/settings.run1" && ok "install: second run identical" || ko "inst
 echo "$OUT" | grep -q "backup" && ko "install: no backups if nothing changed" || ok "install: no backups if nothing changed"
 
 # commit identity
+key_tmps() { (cd "$HOME/.claude" && for f in .nodiclaude-key.*; do [ -e "$f" ] && echo "$f"; done); }
 tree_of() { (cd "$HOME" && find . 2>/dev/null | LC_ALL=C sort); }
 newhome
 inst "$MAIN/install.sh"
@@ -1021,7 +1022,7 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   check "env key: user.name" "Dev Eloper" "$(git config --global user.name)"
   HALL="$(NODICLAUDE_SIGNING_KEY="$SK" bash "$AH" 2>&1)"
   case "$HALL" in *"BEGIN OPENSSH"*|*"$(sed -n 2p "$KEYDIR/k")"*) ko "env key: hook never prints the key" ;; *) ok "env key: hook never prints the key" ;; esac
-  check "env key: no temp files left" "" "$(cd "$HOME/.claude" && ls -A | grep '^\.nodiclaude-key\.')"
+  check "env key: no temp files left" "" "$(key_tmps)"
   rm -rf "$T/signrepo3"
   git init -q "$T/signrepo3"
   git -C "$T/signrepo3" commit -q --allow-empty -m "feat: signed" 2>/dev/null
@@ -1054,7 +1055,7 @@ SECRET-GARBAGE" bash "$AH" 2>&1)"
   cmp -s "$SKF" "$T/skf.before" && ok "env key: invalid leaves existing key file untouched" || ko "env key: invalid leaves existing key file untouched"
   check "env key: invalid with existing key => mode kept" "-rw-------" "$(mode_of "$SKF")"
   case "$HALL" in *SECRET-GARBAGE*) ko "env key: invalid key not echoed" ;; *) ok "env key: invalid key not echoed" ;; esac
-  check "env key: invalid leaves no temp files" "" "$(cd "$HOME/.claude" && ls -A | grep '^\.nodiclaude-key\.')"
+  check "env key: invalid leaves no temp files" "" "$(key_tmps)"
   # Invalid key in the environment without a key file: nothing written, unsigned.
   rm -f "$SKF"
   git config --global commit.gpgsign true
@@ -1064,7 +1065,7 @@ SECRET-GARBAGE" bash "$AH" 2>/dev/null)"
   check "env key: invalid => prints nothing" "" "$HOUT"
   [ ! -e "$SKF" ] && ok "env key: invalid => no key file written" || ko "env key: invalid => no key file written"
   check "env key: invalid => gpgsign=false" "false" "$(git config --global commit.gpgsign)"
-  check "env key: invalid => no temp files" "" "$(cd "$HOME/.claude" && ls -A | grep '^\.nodiclaude-key\.')"
+  check "env key: invalid => no temp files" "" "$(key_tmps)"
   # Key path is a symlink to a directory outside ~/.claude: the link is replaced, nothing lands outside.
   rm -rf "$T/outdir"; mkdir -p "$T/outdir"
   ln -s "$T/outdir" "$SKF"
