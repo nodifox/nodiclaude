@@ -15,6 +15,17 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "^mcp__github__(create_pull_request|update_pull_request|add_issue_comment|update_issue_comment|add_reply_to_pull_request_comment|add_comment_to_pending_review|pull_request_review_write|issue_write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/check-attribution.sh"
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [
