@@ -22,7 +22,7 @@ export GIT_CONFIG_NOSYSTEM=1
 mkdir -p "$HOME"
 : > "$GIT_CONFIG_GLOBAL"
 unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
-unset NODICLAUDE_GIT_NAME NODICLAUDE_GIT_EMAIL NODICLAUDE_ALLOW_ANY_BRANCH
+unset NODICLAUDE_GIT_NAME NODICLAUDE_GIT_EMAIL NODICLAUDE_ALLOW_ANY_BRANCH NODICLAUDE_SIGNING_KEY
 # Git config passed through the environment (e.g. by cloud platforms) would leak into the tests.
 unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_DIR GIT_WORK_TREE
 for v in $(env | grep -E '^GIT_CONFIG_(KEY|VALUE)_[0-9]+=' | cut -d= -f1); do unset "$v"; done
@@ -915,6 +915,114 @@ bash "$T/repocopy/install.sh" >/dev/null 2>&1
 grep -q "check-update" "$S" && ko "settings: removed hook entries dropped" "$(cat "$S")" || ok "settings: removed hook entries dropped"
 check "settings: other hooks kept after removal" '$HOME/.claude/hooks/check-git-identity.sh' "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S")"
 
+# --cloud with NODICLAUDE_SIGNING_KEY: commits are signed with the user's own SSH key
+echo "== cloud signing key =="
+if command -v ssh-keygen >/dev/null 2>&1; then
+  KEYDIR="$T/sigkeys"
+  mkdir -p "$KEYDIR"
+  ssh-keygen -q -t ed25519 -N "" -C "nodiclaude-test" -f "$KEYDIR/k" >/dev/null 2>&1
+  SK="$(cat "$KEYDIR/k")"
+  SKF="$HOME/.claude/.nodiclaude-signing-key"
+  sk_cloud() { NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="dev@x.io" NODICLAUDE_SIGNING_KEY="$SK" inst "$MAIN/install.sh" --cloud; }
+  mode_of() { ls -l "$1" | cut -c1-10; }
+
+  newhome
+  git config --global user.name "Claude"
+  git config --global user.email "noreply@anthropic.com"
+  git config --global gpg.program "/tmp/code-sign"
+  git config --global gpg.ssh.program "/tmp/code-sign"
+  git config --global commit.gpgsign false
+  sk_cloud
+  check "signing: rc" 0 "$RC"
+  check "signing: key file mode" "-rw-------" "$(mode_of "$SKF")"
+  check "signing: key file content" "$SK" "$(cat "$SKF")"
+  check "signing: gpg.format" "ssh" "$(git config --global gpg.format)"
+  check "signing: user.signingkey" "$SKF" "$(git config --global user.signingkey)"
+  check "signing: gpg.ssh.program overridden" "ssh-keygen" "$(git config --global gpg.ssh.program)"
+  check "signing: commit.gpgsign" "true" "$(git config --global commit.gpgsign)"
+  case "$OUT" in *"BEGIN OPENSSH"*|*"$(sed -n 2p "$KEYDIR/k")"*) ko "signing: key never printed" ;; *) ok "signing: key never printed" ;; esac
+  sk_cloud
+  echo "$OUT" | grep -q "git config --global .* written\|signing key written" && ko "signing: second run writes nothing" "$OUT" || ok "signing: second run writes nothing"
+  # A real signed commit verifies with an allowed-signers file.
+  printf '%s %s\n' "dev@x.io" "$(cut -d' ' -f1,2 "$KEYDIR/k.pub")" > "$KEYDIR/allowed"
+  rm -rf "$T/signrepo"
+  git init -q "$T/signrepo"
+  git -C "$T/signrepo" commit -q --allow-empty -m "feat: signed" 2>"$T/sign.err"
+  check "signing: commit succeeds" 0 "$?"
+  git -C "$T/signrepo" -c gpg.ssh.allowedSignersFile="$KEYDIR/allowed" verify-commit HEAD >/dev/null 2>&1
+  check "signing: git verify-commit passes" 0 "$?"
+  git -C "$T/signrepo" cat-file commit HEAD | grep -q "^gpgsig " && ok "signing: commit carries a signature" || ko "signing: commit carries a signature"
+  # The hook re-applies the config after the platform rewrites the gitconfig.
+  git config --global user.name "Claude"
+  git config --global commit.gpgsign false
+  git config --global gpg.format openpgp
+  git config --global gpg.ssh.program "/tmp/code-sign"
+  git config --global --unset user.signingkey
+  bash "$HOME/.claude/hooks/nodiclaude-apply-identity.sh"
+  check "signing: hook restores gpg.format" "ssh" "$(git config --global gpg.format)"
+  check "signing: hook restores user.signingkey" "$SKF" "$(git config --global user.signingkey)"
+  check "signing: hook restores gpg.ssh.program" "ssh-keygen" "$(git config --global gpg.ssh.program)"
+  check "signing: hook restores commit.gpgsign" "true" "$(git config --global commit.gpgsign)"
+  check "signing: hook restores user.name" "Dev Eloper" "$(git config --global user.name)"
+  # Without the variable: unsigned and the stale key is removed (the hook follows).
+  NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="dev@x.io" inst "$MAIN/install.sh" --cloud
+  check "signing: no key => rc" 0 "$RC"
+  check "signing: no key => gpgsign=false" "false" "$(git config --global commit.gpgsign)"
+  [ ! -e "$SKF" ] && ok "signing: no key => stale key file removed" || ko "signing: no key => stale key file removed"
+  git config --global commit.gpgsign true
+  bash "$HOME/.claude/hooks/nodiclaude-apply-identity.sh"
+  check "signing: hook without key file => gpgsign=false" "false" "$(git config --global commit.gpgsign)"
+  # Key without trailing newline and CRLF-free multi-line value works too.
+  printf '%s' "$SK" > "$KEYDIR/k.nonl"
+  NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="dev@x.io" NODICLAUDE_SIGNING_KEY="$(cat "$KEYDIR/k.nonl")" inst "$MAIN/install.sh" --cloud
+  check "signing: key without trailing newline => rc" 0 "$RC"
+  # CRLF key (e.g. pasted from Windows) installs and signs.
+  newhome
+  CRLFKEY="$(sed 's/$/\r/' "$KEYDIR/k")"
+  NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="dev@x.io" NODICLAUDE_SIGNING_KEY="$CRLFKEY" inst "$MAIN/install.sh" --cloud
+  check "signing: CRLF key => rc" 0 "$RC"
+  check "signing: CRLF key stored without CR" "$SK" "$(cat "$SKF")"
+  rm -rf "$T/signrepo2"
+  git init -q "$T/signrepo2"
+  git -C "$T/signrepo2" commit -q --allow-empty -m "feat: signed" 2>/dev/null
+  git -C "$T/signrepo2" -c gpg.ssh.allowedSignersFile="$KEYDIR/allowed" verify-commit HEAD >/dev/null 2>&1
+  check "signing: CRLF key signs and verifies" 0 "$?"
+  # The hook does not enable signing when ssh-keygen is missing (PATH without it).
+  NOSSH="$T/nossh-bin"
+  mkdir -p "$NOSSH"
+  for c in git sed bash cat; do ln -sf "$(command -v $c)" "$NOSSH/$c"; done
+  git config --global commit.gpgsign true
+  PATH="$NOSSH" "$(command -v bash)" "$HOME/.claude/hooks/nodiclaude-apply-identity.sh"
+  check "signing: hook without ssh-keygen => gpgsign=false" "false" "$(git config --global commit.gpgsign)"
+  # Uninstall removes the key.
+  inst "$MAIN/install.sh" --uninstall
+  [ ! -e "$SKF" ] && ok "uninstall: signing key removed" || ko "uninstall: signing key removed"
+
+  # Invalid key: rc 1 and nothing changed.
+  newhome
+  git config --global user.name "Claude"
+  cp "$GIT_CONFIG_GLOBAL" "$T/gitconfig.before"
+  NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="dev@x.io" NODICLAUDE_SIGNING_KEY="not a key
+SECRET-GARBAGE" inst "$MAIN/install.sh" --cloud
+  check "signing: invalid key => rc 1" 1 "$RC"
+  echo "$OUT" | grep -q "ERROR.*NODICLAUDE_SIGNING_KEY" && ok "signing: invalid key explains the error" || ko "signing: invalid key explains the error" "$OUT"
+  case "$OUT" in *SECRET-GARBAGE*) ko "signing: invalid key not echoed" ;; *) ok "signing: invalid key not echoed" ;; esac
+  check "signing: invalid key creates nothing" "." "$(tree_of)"
+  cmp -s "$GIT_CONFIG_GLOBAL" "$T/gitconfig.before" && ok "signing: invalid key leaves gitconfig alone" || ko "signing: invalid key leaves gitconfig alone"
+
+  # Without --cloud the variable is ignored with a warning.
+  newhome
+  git config --global user.name "Loc Al"
+  git config --global user.email "loc@x.io"
+  NODICLAUDE_SIGNING_KEY="$SK" inst "$MAIN/install.sh"
+  check "signing: ignored without --cloud => rc" 0 "$RC"
+  echo "$OUT" | grep -q "WARNING.*NODICLAUDE_SIGNING_KEY.*ignoring" && ok "signing: ignored without --cloud warns" || ko "signing: ignored without --cloud warns" "$OUT"
+  [ ! -e "$HOME/.claude/.nodiclaude-signing-key" ] && ok "signing: ignored without --cloud writes no key" || ko "signing: ignored without --cloud writes no key"
+  check "signing: ignored without --cloud sets no gpgsign" "" "$(git config --global commit.gpgsign)"
+else
+  echo "SKIP: cloud signing key tests (ssh-keygen not installed)"
+fi
+
 # --- README cloud setup script -----------------------------------------------------
 echo "== readme cloud setup script =="
 SNIP="$T/cloud-setup.sh"
@@ -927,7 +1035,7 @@ awk '
 ' "$ROOT/README.md" > "$SNIP"
 [ -s "$SNIP" ] && ok "readme: cloud setup block extracted" || ko "readme: cloud setup block extracted"
 bash -n "$SNIP" && ok "readme: cloud setup script is valid bash" || ko "readme: cloud setup script is valid bash"
-for pat in '--branch main' '^# rev:' '^export NODICLAUDE_GIT_NAME=""$' '^export NODICLAUDE_GIT_EMAIL=""$' 'NODICLAUDE_GH_TOKEN' '\$DEST/install\.sh" --cloud'; do
+for pat in '--branch main' '^# rev:' '^export NODICLAUDE_GIT_NAME=""$' '^export NODICLAUDE_GIT_EMAIL=""$' '^export NODICLAUDE_SIGNING_KEY=""$' 'NODICLAUDE_GH_TOKEN' '\$DEST/install\.sh" --cloud'; do
   grep -q -- "$pat" "$SNIP" && ok "readme: cloud setup script contains $pat" || ko "readme: cloud setup script contains $pat"
 done
 # Dry run against a local repo standing in for the remote (copy of the snippet, test values).
