@@ -1208,66 +1208,53 @@ awk '
 ' "$ROOT/README.md" > "$SNIP"
 [ -s "$SNIP" ] && ok "readme: cloud setup block extracted" || ko "readme: cloud setup block extracted"
 bash -n "$SNIP" && ok "readme: cloud setup script is valid bash" || ko "readme: cloud setup script is valid bash"
-for pat in '--branch main' '^# rev:' '^export NODICLAUDE_GIT_NAME=""$' '^export NODICLAUDE_GIT_EMAIL=""$' '\$DEST/install\.sh" --cloud' 'remote set-url origin "\$URL"'; do
+for pat in '--branch main' '^# rev:' '^export NODICLAUDE_GIT_NAME=""$' '^export NODICLAUDE_GIT_EMAIL=""$' '--depth 1' '"\$URL" "\$DEST"' '\$DEST/install\.sh" --cloud'; do
   grep -q -- "$pat" "$SNIP" && ok "readme: cloud setup script contains $pat" || ko "readme: cloud setup script contains $pat"
 done
 # No secrets in the setup script: no token, no signing key, no injected auth header.
 for pat in 'TOKEN' 'SIGNING_KEY' 'GIT_CONFIG_' 'extraheader' 'Authorization'; do
   grep -qi -- "$pat" "$SNIP" && ko "readme: cloud setup script has no $pat" || ok "readme: cloud setup script has no $pat"
 done
-# Dry runs: a work directory with a nodiclaude checkout stands in for the platform's checkout.
-# The fixed /home/user path is dropped so the runs do not depend on the machine.
-setup_copy() { # setup_copy <out> [identity: yes|no]
-  sed -e 's#^for d in .*; do$#for d in "$PWD/nodiclaude" "$HOME/nodiclaude"; do#' "$SNIP" > "$1"
-  if [ "${2:-yes}" = yes ]; then
+# Dry runs: the URL= line is replaced by a local repo with a main branch, standing in for GitHub.
+# install.sh records origin, which is the clone URL, so with the real script it records GitHub.
+setup_copy() { # setup_copy <out> <url> [identity: yes|no]
+  sed -e "s#^URL=.*#URL=\"$2\"#" "$SNIP" > "$1"
+  if [ "${3:-yes}" = yes ]; then
     sed -i.bak -e 's#^export NODICLAUDE_GIT_NAME=.*#export NODICLAUDE_GIT_NAME="Cloud Test"#' \
                -e 's#^export NODICLAUDE_GIT_EMAIL=.*#export NODICLAUDE_GIT_EMAIL="cloud@x.io"#' "$1"
     rm -f "$1.bak"
   fi
 }
-WD="$T/setupwd"
+check "readme: cloud setup script clones from GitHub" 'URL="https://github.com/nodifox/nodiclaude.git"' "$(grep '^URL=' "$SNIP")"
+SRCURL="file://$MAIN"
 newhome
-rm -rf "$WD"; mkdir -p "$WD"
-git clone -q "$MAIN" "$WD/nodiclaude"
-setup_copy "$T/cloud-setup.test.sh"
-if ! grep -q '/home/user' "$T/cloud-setup.test.sh"; then
-  ok "readme: dry run checkout list substituted"
-  OUT="$(cd "$WD" && bash "$T/cloud-setup.test.sh" 2>&1)"
+setup_copy "$T/cloud-setup.test.sh" "$SRCURL"
+if grep -qx "URL=\"$SRCURL\"" "$T/cloud-setup.test.sh"; then
+  ok "readme: dry run URL substituted"
+  OUT="$(bash "$T/cloud-setup.test.sh" 2>&1)"
   RC=$?
   check "readme: cloud setup dry run exits 0" 0 "$RC"
   [ -f "$HOME/.claude/rules/git-commits.md" ] && ok "readme: cloud setup dry run installs rules/git-commits.md" || ko "readme: cloud setup dry run installs rules/git-commits.md" "$OUT"
   check "readme: cloud setup dry run writes identity" "Cloud Test" "$(git config --global user.name)"
   check "readme: cloud setup dry run disables signing" "false" "$(git config --global commit.gpgsign)"
-  check "readme: version file points at GitHub" "https://github.com/nodifox/nodiclaude.git" "$(sed -n 2p "$HOME/.claude/.nodiclaude-version")"
-  check "readme: version file has the checkout's main" "$(git -C "$MAIN" rev-parse HEAD)" "$(sed -n 1p "$HOME/.claude/.nodiclaude-version")"
-  # Checkout without a local main: installs its current commit, with a note.
-  newhome
-  rm -rf "$WD"; mkdir -p "$WD"
-  git clone -q "$MAIN" "$WD/nodiclaude"
-  git -C "$WD/nodiclaude" checkout -q -b claude/session
-  git -C "$WD/nodiclaude" branch -q -D main
-  OUT="$(cd "$WD" && bash "$T/cloud-setup.test.sh" 2>&1)"
-  RC=$?
-  check "readme: no local main => rc 0" 0 "$RC"
-  case "$OUT" in *"no local main"*) ok "readme: no local main => note";; *) ko "readme: no local main => note" "$OUT";; esac
-  [ -f "$HOME/.claude/rules/git-commits.md" ] && ok "readme: no local main => installs" || ko "readme: no local main => installs" "$OUT"
+  check "readme: version file records the clone URL" "$SRCURL" "$(sed -n 2p "$HOME/.claude/.nodiclaude-version")"
+  check "readme: version file has main's commit" "$(git -C "$MAIN" rev-parse main)" "$(sed -n 1p "$HOME/.claude/.nodiclaude-version")"
   # Unfilled identity: the script fails and changes nothing.
   newhome
-  setup_copy "$T/cloud-setup.unfilled.sh" no
-  OUT="$(cd "$WD" && bash "$T/cloud-setup.unfilled.sh" 2>&1)"
+  setup_copy "$T/cloud-setup.unfilled.sh" "$SRCURL" no
+  OUT="$(bash "$T/cloud-setup.unfilled.sh" 2>&1)"
   RC=$?
   check "readme: unfilled identity => rc 1" 1 "$RC"
   check "readme: unfilled identity creates nothing" "." "$(tree_of)"
-  # No checkout (nodiclaude not on the session): ERROR naming the fix, exit 1, nothing installed.
+  # Clone failure (unreachable repo): non-zero exit, nothing installed.
   newhome
-  rm -rf "$WD"; mkdir -p "$WD"
-  ERR="$(cd "$WD" && bash "$T/cloud-setup.test.sh" 2>&1 >/dev/null)"
+  setup_copy "$T/cloud-setup.noclone.sh" "file://$T/no-such-repo"
+  OUT="$(bash "$T/cloud-setup.noclone.sh" 2>&1)"
   RC=$?
-  check "readme: no checkout => rc 1" 1 "$RC"
-  case "$ERR" in *ERROR*"nodifox/nodiclaude"*"Repositories"*) ok "readme: no checkout prints ERROR on stderr";; *) ko "readme: no checkout prints ERROR on stderr" "$ERR";; esac
-  check "readme: no checkout creates nothing" "." "$(tree_of)"
+  [ "$RC" -ne 0 ] && ok "readme: clone failure => non-zero rc" || ko "readme: clone failure => non-zero rc" "$OUT"
+  check "readme: clone failure creates nothing" "." "$(tree_of)"
 else
-  ko "readme: dry run checkout list substituted"
+  ko "readme: dry run URL substituted"
   echo "SKIP: cloud setup dry run not executed (substitution failed)"
 fi
 
