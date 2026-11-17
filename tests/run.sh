@@ -323,6 +323,18 @@ echo "$OUT" | grep -q "WARNING.*user.name" && echo "$OUT" | grep -q "WARNING.*us
 
 echo "$OUT" | grep -q "NODICLAUDE_GIT_NAME requires" && echo "$OUT" | grep -q "NODICLAUDE_GIT_EMAIL requires" && ok "install: WARNING names the variables in uppercase" || ko "install: WARNING names the variables in uppercase" "$OUT"
 check "install: different global still writes the identity file" "N Dos" "$(sed -n 1p "$HOME/.claude/.nodiclaude-identity")"
+# Old cloud setup script (no --cloud) on an image with the platform identity: the installed
+# hook must block commits made under the platform identity instead of letting them through.
+newhome
+git config --global user.name "Claude"
+git config --global user.email "noreply@anthropic.com"
+NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="dev@x.io" inst "$MAIN/install.sh"
+mkrepo "$T/platformid" "Claude" "noreply@anthropic.com"
+git -C "$T/platformid" config --unset user.name
+git -C "$T/platformid" config --unset user.email
+ERR="$(jq -n --arg c "git commit -m x" --arg d "$T/platformid" '{tool_input:{command:$c},cwd:$d}' | bash "$HOME/.claude/hooks/check-git-identity.sh" 2>&1 >/dev/null)"
+check "install: without --cloud, commits as the platform identity are blocked" 2 "$?"
+case "$ERR" in *"Dev Eloper"*) ok "install: without --cloud, the block names the developer identity" ;; *) ko "install: block message names the developer" "$ERR" ;; esac
 
 # --cloud: the setup script identity replaces the image's and commit signing is turned off
 newhome
