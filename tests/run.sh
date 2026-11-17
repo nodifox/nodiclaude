@@ -271,6 +271,7 @@ cmp -s "$S" "$T/settings.run1" && ok "install: second run identical" || ko "inst
 echo "$OUT" | grep -q "backup" && ko "install: no backups if nothing changed" || ok "install: no backups if nothing changed"
 
 # commit identity
+key_tmps() { (cd "$HOME/.claude" && for f in .nodiclaude-key.*; do [ -e "$f" ] && echo "$f"; done); }
 tree_of() { (cd "$HOME" && find . 2>/dev/null | LC_ALL=C sort); }
 newhome
 inst "$MAIN/install.sh"
@@ -998,6 +999,89 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   inst "$MAIN/install.sh" --uninstall
   [ ! -e "$SKF" ] && ok "uninstall: signing key removed" || ko "uninstall: signing key removed"
 
+  # Key as an environment variable of the cloud environment: the setup script does not see it,
+  # the SessionStart hook installs it from the session's environment.
+  newhome
+  git config --global user.name "Claude"
+  git config --global user.email "noreply@anthropic.com"
+  git config --global gpg.ssh.program "/tmp/code-sign"
+  git config --global commit.gpgsign true
+  NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="dev@x.io" inst "$MAIN/install.sh" --cloud
+  check "env key: setup without key => rc" 0 "$RC"
+  check "env key: setup without key => gpgsign=false" "false" "$(git config --global commit.gpgsign)"
+  AH="$HOME/.claude/hooks/nodiclaude-apply-identity.sh"
+  HOUT="$(NODICLAUDE_SIGNING_KEY="$SK" bash "$AH" 2>/dev/null)"
+  check "env key: hook rc" 0 "$?"
+  check "env key: hook prints nothing to stdout" "" "$HOUT"
+  check "env key: key file mode" "-rw-------" "$(mode_of "$SKF")"
+  check "env key: key file content" "$SK" "$(cat "$SKF")"
+  check "env key: gpg.format" "ssh" "$(git config --global gpg.format)"
+  check "env key: user.signingkey" "$SKF" "$(git config --global user.signingkey)"
+  check "env key: gpg.ssh.program" "ssh-keygen" "$(git config --global gpg.ssh.program)"
+  check "env key: commit.gpgsign" "true" "$(git config --global commit.gpgsign)"
+  check "env key: user.name" "Dev Eloper" "$(git config --global user.name)"
+  HALL="$(NODICLAUDE_SIGNING_KEY="$SK" bash "$AH" 2>&1)"
+  case "$HALL" in *"BEGIN OPENSSH"*|*"$(sed -n 2p "$KEYDIR/k")"*) ko "env key: hook never prints the key" ;; *) ok "env key: hook never prints the key" ;; esac
+  check "env key: no temp files left" "" "$(key_tmps)"
+  rm -rf "$T/signrepo3"
+  git init -q "$T/signrepo3"
+  git -C "$T/signrepo3" commit -q --allow-empty -m "feat: signed" 2>/dev/null
+  check "env key: commit succeeds" 0 "$?"
+  git -C "$T/signrepo3" -c gpg.ssh.allowedSignersFile="$KEYDIR/allowed" verify-commit HEAD >/dev/null 2>&1
+  check "env key: git verify-commit passes" 0 "$?"
+  # CRLF and surrounding whitespace are normalized like install.sh does.
+  rm -f "$SKF"
+  git config --global commit.gpgsign false
+  HOUT="$(NODICLAUDE_SIGNING_KEY="
+  $(sed 's/$/\r/' "$KEYDIR/k")
+
+" bash "$AH" 2>/dev/null)"
+  check "env key: CRLF/whitespace hook rc" 0 "$?"
+  check "env key: CRLF/whitespace hook prints nothing" "" "$HOUT"
+  check "env key: CRLF/whitespace key file mode" "-rw-------" "$(mode_of "$SKF")"
+  check "env key: CRLF/whitespace key normalized" "$SK" "$(cat "$SKF")"
+  check "env key: CRLF/whitespace key ends with one newline" "$(printf '%s\n' "$SK" | od -c | tail -n 2)" "$(od -c < "$SKF" | tail -n 2)"
+  check "env key: CRLF/whitespace commit.gpgsign" "true" "$(git config --global commit.gpgsign)"
+  rm -rf "$T/signrepo4"
+  git init -q "$T/signrepo4"
+  git -C "$T/signrepo4" commit -q --allow-empty -m "feat: signed" 2>/dev/null
+  git -C "$T/signrepo4" -c gpg.ssh.allowedSignersFile="$KEYDIR/allowed" verify-commit HEAD >/dev/null 2>&1
+  check "env key: CRLF/whitespace key signs and verifies" 0 "$?"
+  # Invalid key in the environment with an existing valid key file: the file is left untouched.
+  cp -p "$SKF" "$T/skf.before"
+  HALL="$(NODICLAUDE_SIGNING_KEY="not a key
+SECRET-GARBAGE" bash "$AH" 2>&1)"
+  check "env key: invalid with existing key => rc" 0 "$?"
+  cmp -s "$SKF" "$T/skf.before" && ok "env key: invalid leaves existing key file untouched" || ko "env key: invalid leaves existing key file untouched"
+  check "env key: invalid with existing key => mode kept" "-rw-------" "$(mode_of "$SKF")"
+  case "$HALL" in *SECRET-GARBAGE*) ko "env key: invalid key not echoed" ;; *) ok "env key: invalid key not echoed" ;; esac
+  check "env key: invalid leaves no temp files" "" "$(key_tmps)"
+  # Invalid key in the environment without a key file: nothing written, unsigned.
+  rm -f "$SKF"
+  git config --global commit.gpgsign true
+  HOUT="$(NODICLAUDE_SIGNING_KEY="not a key
+SECRET-GARBAGE" bash "$AH" 2>/dev/null)"
+  check "env key: invalid => rc 0" 0 "$?"
+  check "env key: invalid => prints nothing" "" "$HOUT"
+  [ ! -e "$SKF" ] && ok "env key: invalid => no key file written" || ko "env key: invalid => no key file written"
+  check "env key: invalid => gpgsign=false" "false" "$(git config --global commit.gpgsign)"
+  check "env key: invalid => no temp files" "" "$(key_tmps)"
+  # Key path is a symlink to a directory outside ~/.claude: the link is replaced, nothing lands outside.
+  rm -rf "$T/outdir"; mkdir -p "$T/outdir"
+  ln -s "$T/outdir" "$SKF"
+  NODICLAUDE_SIGNING_KEY="$SK" bash "$AH" >/dev/null 2>&1
+  check "env key: symlinked dir => nothing written outside" "" "$(ls -A "$T/outdir")"
+  [ -f "$SKF" ] && [ ! -L "$SKF" ] && ok "env key: symlinked dir => regular key file" || ko "env key: symlinked dir => regular key file"
+  check "env key: symlinked dir => commit.gpgsign" "true" "$(git config --global commit.gpgsign)"
+  # Key path is a directory: left alone and signing stays off.
+  rm -f "$SKF"; mkdir -p "$SKF"
+  NODICLAUDE_SIGNING_KEY="$SK" bash "$AH" >/dev/null 2>&1
+  check "env key: directory => rc 0" 0 "$?"
+  check "env key: directory => gpgsign=false" "false" "$(git config --global commit.gpgsign)"
+  check "env key: directory => left empty" "" "$(ls -A "$SKF")"
+  rmdir "$SKF"
+  inst "$MAIN/install.sh" --uninstall
+
   # Invalid key: rc 1 and nothing changed.
   newhome
   git config --global user.name "Claude"
@@ -1035,8 +1119,12 @@ awk '
 ' "$ROOT/README.md" > "$SNIP"
 [ -s "$SNIP" ] && ok "readme: cloud setup block extracted" || ko "readme: cloud setup block extracted"
 bash -n "$SNIP" && ok "readme: cloud setup script is valid bash" || ko "readme: cloud setup script is valid bash"
-for pat in '--branch main' '^# rev:' '^export NODICLAUDE_GIT_NAME=""$' '^export NODICLAUDE_GIT_EMAIL=""$' '^export NODICLAUDE_SIGNING_KEY=""$' 'NODICLAUDE_GH_TOKEN' '\$DEST/install\.sh" --cloud'; do
+for pat in '--branch main' '^# rev:' '^export NODICLAUDE_GIT_NAME=""$' '^export NODICLAUDE_GIT_EMAIL=""$' '\$DEST/install\.sh" --cloud'; do
   grep -q -- "$pat" "$SNIP" && ok "readme: cloud setup script contains $pat" || ko "readme: cloud setup script contains $pat"
+done
+# No secrets in the setup script: no token, no signing key, no injected auth header.
+for pat in 'TOKEN' 'SIGNING_KEY' 'GIT_CONFIG_' 'extraheader' 'Authorization'; do
+  grep -qi -- "$pat" "$SNIP" && ko "readme: cloud setup script has no $pat" || ok "readme: cloud setup script has no $pat"
 done
 # Dry run against a local repo standing in for the remote (copy of the snippet, test values).
 newhome
@@ -1046,7 +1134,6 @@ git clone -q --bare "$MAIN" "$BARE"
 sed -e "s#^URL=.*#URL=\"file://$BARE\"#" \
     -e 's#^export NODICLAUDE_GIT_NAME=.*#export NODICLAUDE_GIT_NAME="Cloud Test"#' \
     -e 's#^export NODICLAUDE_GIT_EMAIL=.*#export NODICLAUDE_GIT_EMAIL="cloud@x.io"#' \
-    -e 's#^NODICLAUDE_GH_TOKEN=.*#NODICLAUDE_GH_TOKEN="test-token"#' \
     "$SNIP" > "$T/cloud-setup.test.sh"
 if grep -q "^URL=\"file://$BARE\"" "$T/cloud-setup.test.sh"; then
   ok "readme: dry run URL substituted with local repo"
@@ -1059,23 +1146,22 @@ if grep -q "^URL=\"file://$BARE\"" "$T/cloud-setup.test.sh"; then
   # Unfilled identity: the script fails and changes nothing.
   newhome
   sed -e "s#^URL=.*#URL=\"file://$BARE\"#" \
-      -e 's#^NODICLAUDE_GH_TOKEN=.*#NODICLAUDE_GH_TOKEN="test-token"#' \
       "$SNIP" > "$T/cloud-setup.unfilled.sh"
   OUT="$(bash "$T/cloud-setup.unfilled.sh" 2>&1)"
   RC=$?
   check "readme: unfilled identity => rc 1" 1 "$RC"
   check "readme: unfilled identity creates nothing" "." "$(tree_of)"
-  # Empty token: the script fails before cloning and installs nothing.
+  # Clone failure (e.g. nodiclaude not on the session): ERROR naming the fix, exit 1, nothing installed.
   newhome
-  sed -e "s#^URL=.*#URL=\"file://$BARE\"#" \
+  sed -e "s#^URL=.*#URL=\"file://$T/missing.git\"#" \
       -e 's#^export NODICLAUDE_GIT_NAME=.*#export NODICLAUDE_GIT_NAME="Cloud Test"#' \
       -e 's#^export NODICLAUDE_GIT_EMAIL=.*#export NODICLAUDE_GIT_EMAIL="cloud@x.io"#' \
-      "$SNIP" > "$T/cloud-setup.notoken.sh"
-  OUT="$(bash "$T/cloud-setup.notoken.sh" 2>&1)"
+      "$SNIP" > "$T/cloud-setup.noclone.sh"
+  ERR="$(bash "$T/cloud-setup.noclone.sh" 2>&1 >/dev/null)"
   RC=$?
-  check "readme: empty token => rc 1" 1 "$RC"
-  case "$OUT" in *"NODICLAUDE_GH_TOKEN is empty"*) ok "readme: empty token prints ERROR";; *) ko "readme: empty token prints ERROR" "$OUT";; esac
-  check "readme: empty token creates nothing" "." "$(tree_of)"
+  check "readme: clone failure => rc 1" 1 "$RC"
+  case "$ERR" in *ERROR*"nodifox/nodiclaude"*"Repositories"*) ok "readme: clone failure prints ERROR on stderr";; *) ko "readme: clone failure prints ERROR on stderr" "$ERR";; esac
+  check "readme: clone failure creates nothing" "." "$(tree_of)"
 else
   ko "readme: dry run URL substituted with local repo"
   echo "SKIP: cloud setup dry run not executed (URL substitution failed)"
