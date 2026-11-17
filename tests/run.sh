@@ -924,6 +924,8 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   ssh-keygen -q -t ed25519 -N "" -C "nodiclaude-test" -f "$KEYDIR/k" >/dev/null 2>&1
   SK="$(cat "$KEYDIR/k")"
   SKF="$HOME/.claude/.nodiclaude-signing-key"
+  ASF="$HOME/.claude/.nodiclaude-allowed-signers"
+  ASL="dev@x.io namespaces=\"git\" $(ssh-keygen -y -P "" -f "$KEYDIR/k" | cut -d' ' -f1,2)"
   sk_cloud() { NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="dev@x.io" NODICLAUDE_SIGNING_KEY="$SK" inst "$MAIN/install.sh" --cloud; }
   mode_of() { ls -l "$1" | cut -c1-10; }
 
@@ -941,9 +943,24 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   check "signing: user.signingkey" "$SKF" "$(git config --global user.signingkey)"
   check "signing: gpg.ssh.program overridden" "ssh-keygen" "$(git config --global gpg.ssh.program)"
   check "signing: commit.gpgsign" "true" "$(git config --global commit.gpgsign)"
+  check "signing: allowed signers file content" "$ASL" "$(cat "$ASF")"
+  check "signing: gpg.ssh.allowedSignersFile" "$ASF" "$(git config --global gpg.ssh.allowedSignersFile)"
   case "$OUT" in *"BEGIN OPENSSH"*|*"$(sed -n 2p "$KEYDIR/k")"*) ko "signing: key never printed" ;; *) ok "signing: key never printed" ;; esac
   sk_cloud
-  echo "$OUT" | grep -q "git config --global .* written\|signing key written" && ko "signing: second run writes nothing" "$OUT" || ok "signing: second run writes nothing"
+  echo "$OUT" | grep -q "git config --global .* written\|signing key written\|allowed signers file written" && ko "signing: second run writes nothing" "$OUT" || ok "signing: second run writes nothing"
+  # An email change rewrites the allowed signers file (install.sh and the hook), then is restored.
+  NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="new@x.io" NODICLAUDE_SIGNING_KEY="$SK" inst "$MAIN/install.sh" --cloud
+  check "signing: email change => allowed signers file updated" "new${ASL#dev}" "$(cat "$ASF")"
+  sk_cloud
+  check "signing: email restored => allowed signers file updated" "$ASL" "$(cat "$ASF")"
+  cp "$HOME/.claude/.nodiclaude-identity" "$T/identity.before"
+  printf 'Dev Eloper\nhook@x.io\n' > "$HOME/.claude/.nodiclaude-identity"
+  bash "$HOME/.claude/hooks/nodiclaude-apply-identity.sh"
+  check "signing: hook email change => allowed signers file updated" "hook${ASL#dev}" "$(cat "$ASF")"
+  cp "$T/identity.before" "$HOME/.claude/.nodiclaude-identity"
+  bash "$HOME/.claude/hooks/nodiclaude-apply-identity.sh"
+  check "signing: hook email restored => allowed signers file updated" "$ASL" "$(cat "$ASF")"
+  check "signing: hook email restored => user.email" "dev@x.io" "$(git config --global user.email)"
   # A real signed commit verifies with an allowed-signers file.
   printf '%s %s\n' "dev@x.io" "$(cut -d' ' -f1,2 "$KEYDIR/k.pub")" > "$KEYDIR/allowed"
   rm -rf "$T/signrepo"
@@ -952,6 +969,9 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   check "signing: commit succeeds" 0 "$?"
   git -C "$T/signrepo" -c gpg.ssh.allowedSignersFile="$KEYDIR/allowed" verify-commit HEAD >/dev/null 2>&1
   check "signing: git verify-commit passes" 0 "$?"
+  git -C "$T/signrepo" verify-commit HEAD >/dev/null 2>&1
+  check "signing: git verify-commit passes with the installed allowed signers" 0 "$?"
+  git -C "$T/signrepo" log --show-signature -1 2>&1 | grep -q 'Good "git" signature' && ok "signing: git log --show-signature reports a good signature" || ko "signing: git log --show-signature reports a good signature" "$(git -C "$T/signrepo" log --show-signature -1 2>&1)"
   git -C "$T/signrepo" cat-file commit HEAD | grep -q "^gpgsig " && ok "signing: commit carries a signature" || ko "signing: commit carries a signature"
   # The hook re-applies the config after the platform rewrites the gitconfig.
   git config --global user.name "Claude"
@@ -959,7 +979,11 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   git config --global gpg.format openpgp
   git config --global gpg.ssh.program "/tmp/code-sign"
   git config --global --unset user.signingkey
+  git config --global --unset gpg.ssh.allowedSignersFile
+  rm -f "$ASF"
   bash "$HOME/.claude/hooks/nodiclaude-apply-identity.sh"
+  check "signing: hook restores the allowed signers file" "$ASL" "$(cat "$ASF" 2>/dev/null)"
+  check "signing: hook restores gpg.ssh.allowedSignersFile" "$ASF" "$(git config --global gpg.ssh.allowedSignersFile)"
   check "signing: hook restores gpg.format" "ssh" "$(git config --global gpg.format)"
   check "signing: hook restores user.signingkey" "$SKF" "$(git config --global user.signingkey)"
   check "signing: hook restores gpg.ssh.program" "ssh-keygen" "$(git config --global gpg.ssh.program)"
@@ -970,9 +994,22 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   check "signing: no key => rc" 0 "$RC"
   check "signing: no key => gpgsign=false" "false" "$(git config --global commit.gpgsign)"
   [ ! -e "$SKF" ] && ok "signing: no key => stale key file removed" || ko "signing: no key => stale key file removed"
+  [ ! -e "$ASF" ] && ok "signing: no key => allowed signers file removed" || ko "signing: no key => allowed signers file removed"
+  check "signing: no key => gpg.ssh.allowedSignersFile unset" "" "$(git config --global gpg.ssh.allowedSignersFile)"
   git config --global commit.gpgsign true
+  git config --global gpg.ssh.allowedSignersFile "$ASF"
+  printf '%s\n' "$ASL" > "$ASF"
   bash "$HOME/.claude/hooks/nodiclaude-apply-identity.sh"
   check "signing: hook without key file => gpgsign=false" "false" "$(git config --global commit.gpgsign)"
+  [ ! -e "$ASF" ] && ok "signing: hook without key file => allowed signers file removed" || ko "signing: hook without key file => allowed signers file removed"
+  check "signing: hook without key file => gpg.ssh.allowedSignersFile unset" "" "$(git config --global gpg.ssh.allowedSignersFile)"
+  # A gpg.ssh.allowedSignersFile pointing elsewhere is not ours: left alone.
+  git config --global gpg.ssh.allowedSignersFile "$T/other-allowed"
+  NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="dev@x.io" inst "$MAIN/install.sh" --cloud
+  check "signing: no key => other allowedSignersFile kept" "$T/other-allowed" "$(git config --global gpg.ssh.allowedSignersFile)"
+  bash "$HOME/.claude/hooks/nodiclaude-apply-identity.sh"
+  check "signing: hook without key file => other allowedSignersFile kept" "$T/other-allowed" "$(git config --global gpg.ssh.allowedSignersFile)"
+  git config --global --unset gpg.ssh.allowedSignersFile
   # Key without trailing newline and CRLF-free multi-line value works too.
   printf '%s' "$SK" > "$KEYDIR/k.nonl"
   NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="dev@x.io" NODICLAUDE_SIGNING_KEY="$(cat "$KEYDIR/k.nonl")" inst "$MAIN/install.sh" --cloud
@@ -998,6 +1035,7 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   # Uninstall removes the key.
   inst "$MAIN/install.sh" --uninstall
   [ ! -e "$SKF" ] && ok "uninstall: signing key removed" || ko "uninstall: signing key removed"
+  [ ! -e "$ASF" ] && ok "uninstall: allowed signers file removed" || ko "uninstall: allowed signers file removed"
 
   # Key as an environment variable of the cloud environment: the setup script does not see it,
   # the SessionStart hook installs it from the session's environment.
@@ -1019,6 +1057,8 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   check "env key: user.signingkey" "$SKF" "$(git config --global user.signingkey)"
   check "env key: gpg.ssh.program" "ssh-keygen" "$(git config --global gpg.ssh.program)"
   check "env key: commit.gpgsign" "true" "$(git config --global commit.gpgsign)"
+  check "env key: allowed signers file content" "$ASL" "$(cat "$ASF")"
+  check "env key: gpg.ssh.allowedSignersFile" "$ASF" "$(git config --global gpg.ssh.allowedSignersFile)"
   check "env key: user.name" "Dev Eloper" "$(git config --global user.name)"
   HALL="$(NODICLAUDE_SIGNING_KEY="$SK" bash "$AH" 2>&1)"
   case "$HALL" in *"BEGIN OPENSSH"*|*"$(sed -n 2p "$KEYDIR/k")"*) ko "env key: hook never prints the key" ;; *) ok "env key: hook never prints the key" ;; esac
