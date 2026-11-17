@@ -350,6 +350,20 @@ check "cloud: identity file" "Dev Eloper|dev@x.io" "$(sed -n 1p "$HOME/.claude/.
 echo "$OUT" | grep -q "was 'Claude'" && ok "cloud: logs the replaced value" || ko "cloud: logs the replaced value" "$OUT"
 NODICLAUDE_GIT_NAME="Dev Eloper" NODICLAUDE_GIT_EMAIL="dev@x.io" inst "$MAIN/install.sh" --cloud
 echo "$OUT" | grep -q "git config --global .* written" && ko "cloud: second run writes nothing" "$OUT" || ok "cloud: second run writes nothing"
+AH="$HOME/.claude/hooks/nodiclaude-apply-identity.sh"
+[ -x "$AH" ] && ok "cloud: identity hook generated" || ko "cloud: identity hook generated"
+check "cloud: identity hook registered once" "1" "$(jq '[.hooks.SessionStart[].hooks[] | select(.command | endswith("nodiclaude-apply-identity.sh"))] | length' "$HOME/.claude/settings.json")"
+echo "$OUT" | grep -q "settings.json: \|backup:" && ko "cloud: second run leaves settings.json alone" "$OUT" || ok "cloud: second run leaves settings.json alone"
+git config --global user.name "Claude"
+git config --global user.email "noreply@anthropic.com"
+git config --global commit.gpgsign true
+bash "$AH"
+check "cloud: identity hook restores user.name" "Dev Eloper" "$(git config --global user.name)"
+check "cloud: identity hook restores user.email" "dev@x.io" "$(git config --global user.email)"
+check "cloud: identity hook restores gpgsign=false" "false" "$(git config --global commit.gpgsign)"
+inst "$MAIN/install.sh" --uninstall
+[ ! -e "$AH" ] && ok "uninstall: identity hook removed" || ko "uninstall: identity hook removed"
+check "uninstall: identity hook unregistered" "0" "$(jq '[(.hooks.SessionStart // [])[].hooks[]? | select(.command | endswith("nodiclaude-apply-identity.sh"))] | length' "$HOME/.claude/settings.json")"
 newhome
 NODICLAUDE_GIT_NAME="" NODICLAUDE_GIT_EMAIL="" inst "$MAIN/install.sh" --cloud
 check "cloud: empty identity => rc 1" 1 "$RC"
